@@ -12,12 +12,18 @@ CONFIG: projit funkce a nastaveni Stereodepth nastaveni, to je asi to hlavni
 CONFIG: jak se pristupuje ke zpracovani dat z IMU
 CONFIG: report rate na senzorech porovnat s datasheetovymi specifikacemi, take rate jak jsou data odesilana nejak probrat
 
-proc je velikost bufferu takova jaka je
+asi budu moct odstranit jeden dev typ (zacatek main)
+mono xlink is missing
+sedi fakt ty HW resources?
+filtry, confidence threshold
+subpixel???
+bitrate a fps chybi ako makra
 */
 
 #include <iostream>
 #include <thread>
 #include <chrono>
+#include <math.h>
 
 #include <arpa/inet.h> // definitions for internet operations
 #include <errno.h> // error indication
@@ -44,6 +50,7 @@ proc je velikost bufferu takova jaka je
 #define CAM_W 640
 #define CAM_H 400
 #define PAIR_DIST_SQ 9 // threshold macro
+#define MAXIMUM_FEATURES 118
 
 // 2D point location values
 struct MyPoint2d {
@@ -91,7 +98,7 @@ void calc_rect_cam_intri_extri(dai::CalibrationHandler calibData, double* f, dou
         }
     }
     cv::Mat r_m = cv::Mat(3, 3, CV_32FC1, data); // 3x3 matrix of instrinsics as 32bit float
-    std:cout << "camera intrinsics left\n" << l_m << "\n right \n" << r_m << "\n"; // additional temporary(?) printout
+    std::cout << "camera intrinsics left\n" << l_m << "\n right \n" << r_m << "\n"; // additional temporary(?) printout
 
     auto l_d = calibData.getDistortionCoefficients(dai::CameraBoardSocket::CAM_B);
     auto r_d = calibData.getDistortionCoefficients(dai::CameraBoardSocket::CAM_C);
@@ -112,21 +119,30 @@ void calc_rect_cam_intri_extri(dai::CalibrationHandler calibData, double* f, dou
 
 int main(int argc, char **argv) {
     bool imu_ok = false;
-    int ccc=0;
+    int ccc=0; // number of frames
     enum DEV_TYPE {OAK_D, OAK_D_PRO} dev_type;
 
+    // terminate process by calling SIGINT(Ctrl-C)
     struct sigaction act;
     memset(&act, 0, sizeof(act));
-    act.sa_handler = sig_func;
+    act.sa_handler = sig_func; // pointer to function
     sigaction(SIGINT, &act, NULL);
 
+    // creating unix sockets, ipc_local_addr to receive and other two to send data
     struct sockaddr_un ipc_local_addr, imu_addr, features_addr;
     memset(&ipc_local_addr, 0, sizeof(struct sockaddr_un));
     ipc_local_addr.sun_family = AF_UNIX;
     strcpy(ipc_local_addr.sun_path, "/tmp/chobits_2222");
     int ipc_sock = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (ipc_sock < 0) {
+        perror("ipc_sock creation failed");
+        exit(EXIT_FAILURE);
+    }
     unlink("/tmp/chobits_2222");
-    bind(ipc_sock, (struct sockaddr*)&ipc_local_addr, sizeof(ipc_local_addr));
+    if (bind(ipc_sock, (struct sockaddr*)&ipc_local_addr, sizeof(ipc_local_addr)) < 0) {
+        perror("bind failed");
+        exit(EXIT_FAILURE);
+    }
     memset(&imu_addr, 0, sizeof(struct sockaddr_un));
     imu_addr.sun_family = AF_UNIX;
     strcpy(imu_addr.sun_path, "/tmp/chobits_imu");
@@ -152,6 +168,7 @@ int main(int argc, char **argv) {
     auto xout_imu = pipeline.create<dai::node::XLinkOut>();
     // auto xout_focal = pipeline.create<dai::node::XLinkOut>(); //here
 
+    // specify some stream names over which nodes receive their data
     xoutTrackedFeaturesLeft->setStreamName("trackedFeaturesLeft");
     xoutTrackedFeaturesRight->setStreamName("trackedFeaturesRight");
     xout_disp->setStreamName("disparity");
@@ -174,8 +191,8 @@ int main(int argc, char **argv) {
     config = featureTrackerRight->initialConfig.get();
     config.cornerDetector.numMaxFeatures = 100;
     featureTrackerRight->initialConfig.set(config);*/
-    // By default the least mount of resources are allocated
-    // increasing it improves performance when optical flow is enabled
+    
+    // according to API refrence for both Shaves and Memory slices, maximum number is allocated
     featureTrackerLeft->setHardwareResources(2, 2);
     featureTrackerRight->setHardwareResources(2, 2);
 
@@ -220,6 +237,7 @@ int main(int argc, char **argv) {
     // Connect to device and start pipeline
     dai::Device device(pipeline);
 
+    // device parameters readout
     std::cout << "Usb speed: " << device.getUsbSpeed() << "\n";
     std::cout << "Device name: " << device.getDeviceName() << " Product name: " << device.getProductName() << "\n";
     // list cameras so i know which one to configure
@@ -238,35 +256,51 @@ int main(int argc, char **argv) {
 
     dai::CalibrationHandler calibData = device.readCalibration2();
     double f, cx, cy;
+    float baseline = calibData.getBaselineDistance(dai::CameraBoardSocket::CAM_B, dai::CameraBoardSocket::CAM_C, false) * 0.01f;
     calc_rect_cam_intri_extri(calibData, &f, &cx, &cy);
-    double l_inv_k11 = 1.0 / f;
-    double l_inv_k13 = -cx / f;
+    float hfov = 2 * atanf(640 / (2 * f));
+    float vfov = 2 * atanf(400 / (2 * f));
+    std::cout << "stereo baseline:" << baseline << " m, f:" << f << " px, cx:" << cx << ", cy:" << cy << " hfov:" << hfov * 180 / M_PI << " degrees, vfov:" << vfov * 180 / M_PI << " degrees\n";
+
+    // variables for affine transformation
+    double l_inv_k11 = 1.0 / f; // inverse focal length - diopters
+    double l_inv_k13 = -cx / f; // horizontal center/focal length
     double l_inv_k22 = 1.0 / f;
-    double l_inv_k23 = -cy / f;
+    double l_inv_k23 = -cy / f; // vertical center/focal length
     double r_inv_k11 = 1.0 / f;
     double r_inv_k13 = -cx / f;
     double r_inv_k22 = 1.0 / f;
     double r_inv_k23 = -cy / f;
 
+    auto s_pairs = device.getAvailableStereoPairs();
+    for (auto& s_pair : s_pairs) {
+        std::cout << "(TEMPORARY PRINTOUT: possilbe stereo pair baseline:" << s_pair.baseline << " cm\n";
+    }
+
+    // verbose logging
     //device.setLogOutputLevel(dai::LogLevel::DEBUG);
     //device.setLogLevel(dai::LogLevel::DEBUG);
 
     // Output queues used to receive the results
+    // 3rd argument when false specifies that old messages are overwritten when the queue is full
     auto outputFeaturesLeftQueue = device.getOutputQueue("trackedFeaturesLeft", 1, false);
     auto outputFeaturesRightQueue = device.getOutputQueue("trackedFeaturesRight", 1, false);
     auto disp_queue = device.getOutputQueue("disparity", 1, false);
     auto imuQueue = device.getOutputQueue("imu", 5, false);
     // auto focalQueue = device.getOutputQueue("focal", 1, false); //here
 
+    // sequence numbers initialisation
     int l_seq = -1, r_seq = -2, disp_seq = -3;
     // int64_t prev_lens_pos = -1000; //here
     // float prev_lens_pos_raw = -1.0f;//here
-    std::vector<std::uint8_t> disp_frame;
-    std::vector<dai::TrackedFeature> l_features, r_features;
-    std::map<int, MyPoint2d> l_prv_features, r_prv_features;
-    std::map<int, dai::Point2f> r_cur_features;
-    std::chrono::time_point<std::chrono::steady_clock, std::chrono::steady_clock::duration> features_tp, prv_features_tp;
-    std::map<int, int> lr_id_mapping;
+
+    // tools for variable processing
+    std::vector<std::uint8_t> disp_frame; // disparity frame
+    std::vector<dai::TrackedFeature> l_features, r_features; // vectors containing features
+    std::map<int, MyPoint2d> l_prv_features, r_prv_features; // vectors containing features from previous frame
+    std::map<int, dai::Point2f> r_cur_features; // right image current features indexed map
+    std::chrono::time_point<std::chrono::steady_clock, std::chrono::steady_clock::duration> features_tp, prv_features_tp; // timestamps of frames
+    std::map<int, int> lr_id_mapping; // features detected in left image paired to features in right
 
     // Clear queue events
     //jakaskerl suggest remove this line
@@ -276,25 +310,25 @@ int main(int argc, char **argv) {
     while(camera_run) {
         auto q_name = device.getQueueEvent();
 
-        if (q_name == "trackedFeaturesLeft") {
+        if (q_name == "trackedFeaturesLeft") { // waits until specified queue gets a message
             auto data = outputFeaturesLeftQueue->get<dai::TrackedFeatures>();
             l_features = data->trackedFeatures;
-            l_seq = data->getSequenceNum();
-            features_tp = data->getTimestampDevice();
-            //std::cout << "l ft " << l_seq << " latency:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - features_tp).count() << " ms\n";
+            l_seq = data->getSequenceNum(); // retrieve sequence number
+            features_tp = data->getTimestampDevice(); // timestamp from camera
+            std::cout << "l ft " << l_seq << " latency:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - features_tp).count() << " ms\n";
         } else if (q_name == "trackedFeaturesRight") {
             auto data = outputFeaturesRightQueue->get<dai::TrackedFeatures>();
             r_features = data->trackedFeatures;
             r_seq = data->getSequenceNum();
-            //std::cout << "r ft " << r_seq << " latency:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - data->getTimestamp()).count() << " ms\n";
+            std::cout << "r ft " << r_seq << " latency:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - data->getTimestamp()).count() << " ms\n";
             r_cur_features.clear();
             for (const auto &feature : r_features) {
-                r_cur_features[feature.id] = feature.position;
+                r_cur_features[feature.id] = feature.position; // map features to indexes
             }
         } else if (q_name == "disparity") {
             auto disp_data = disp_queue->get<dai::ImgFrame>();
             disp_seq = disp_data->getSequenceNum();
-            disp_frame = disp_data->getData();
+            disp_frame = disp_data->getData(); // return only disparity data from frame
             //std::cout << "stereo " << disp_seq << " latency:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - disp_data->getTimestamp()).count() << " ms\n";
         /*} else if (q_name == "focal") {
             auto data = focalQueue->get<dai::ImgFrame>();
@@ -337,44 +371,44 @@ int main(int argc, char **argv) {
             }
             if (!imu_ok) {
                 imu_ok = true;
-                std::cout<< "imu ok\n";
+                std::cout << "imu ok\n";
             }
         }
 
-        if (l_seq == r_seq && r_seq == disp_seq) {
+        if (l_seq == r_seq && r_seq == disp_seq) { // executes if left, right and disparity frames align
             //auto t1 = std::chrono::steady_clock::now();
             l_seq = -1;
             r_seq = -2;
             disp_seq = -3;
             std::map<int , MyPoint2d> features;
             int c = 0;
-            big_buf[1] = std::chrono::duration<double>(features_tp.time_since_epoch()).count();
-            double* buf_ptr = big_buf + 2;
+            big_buf[1] = std::chrono::duration<double>(features_tp.time_since_epoch()).count(); // duration between epoch and timestamp of frame expressed in seconds
+            double* buf_ptr = big_buf + 2; // first two slots are occupied with timestamps
             for (const auto &l_feature : l_features) {
                 float x = l_feature.position.x;
                 float y = l_feature.position.y;
-                double cur_un_x = l_inv_k11 * x + l_inv_k13;
-                double cur_un_y = l_inv_k22 * y + l_inv_k23;
-                features[l_feature.id] = MyPoint2d(cur_un_x, cur_un_y);
-                auto lr_id = lr_id_mapping.find(l_feature.id);
-                if (lr_id != lr_id_mapping.end()) {
-                    auto r_feature = r_cur_features.find(lr_id->second);
-                    if (r_feature != r_cur_features.end()) {
-                        double dt = std::chrono::duration<double>(features_tp - prv_features_tp).count();
+                double cur_un_x = l_inv_k11 * x + l_inv_k13; // normalised current x position
+                double cur_un_y = l_inv_k22 * y + l_inv_k23; // normalised current y position
+                features[l_feature.id] = MyPoint2d(cur_un_x, cur_un_y); // map of normalised values
+                auto lr_id = lr_id_mapping.find(l_feature.id); // check if feature is one that has a match
+                if (lr_id != lr_id_mapping.end()) { // checks if previous line found instance
+                    auto r_feature = r_cur_features.find(lr_id->second); // tries to find that feature in current right side
+                    if (r_feature != r_cur_features.end()) { // checks if previous line found instance
+                        double dt = std::chrono::duration<double>(features_tp - prv_features_tp).count(); // timestamp difference between current and latest dispartity frame
                         double vx = 0, vy = 0;
-                        auto prv_pos = l_prv_features.find(l_feature.id);
-                        if (prv_pos != l_prv_features.end()) {
+                        auto prv_pos = l_prv_features.find(l_feature.id); // checks if previous left side feature is located in the new one
+                        if (prv_pos != l_prv_features.end()) { // if its found, normalised speed is calculated
                             vx = (cur_un_x - prv_pos->second.x) / dt;
                             vy = (cur_un_y - prv_pos->second.y) / dt;
                         }
-                        buf_ptr[0] = l_feature.id;
-                        buf_ptr[1] = cur_un_x;
-                        buf_ptr[2] = cur_un_y;
-                        buf_ptr[3] = x;
-                        buf_ptr[4] = y;
-                        buf_ptr[5] = vx;
-                        buf_ptr[6] = vy;
-
+                        buf_ptr[0] = l_feature.id; // store id
+                        buf_ptr[1] = cur_un_x; // store normalised position x
+                        buf_ptr[2] = cur_un_y; // and y
+                        buf_ptr[3] = x; // store position x
+                        buf_ptr[4] = y; // and y
+                        buf_ptr[5] = vx; // store x 
+                        buf_ptr[6] = vy; // and y speed
+                        // storing right feature positions instead of left
                         x = r_feature->second.x;
                         y = r_feature->second.y;
                         vx = 0;
@@ -393,25 +427,28 @@ int main(int argc, char **argv) {
                         buf_ptr[11] = vx;
                         buf_ptr[12] = vy;
 
-                        if (c < 118) {
+                        if (c < MAXIMUM_FEATURES) { // maximum number of features
                             ++c;
-                            buf_ptr += 13;
+                            buf_ptr += 13; // move to next position in buffer accordingly
                         }
 
                         continue;
                     }
                 }
-                float row = roundf(y);
+                // rounding down 
                 float col = roundf(x);
-                if (row > CAM_H - 1) row = CAM_H - 1;
+                float row = roundf(y);
+                // setting bounds for possible values
                 if (col > CAM_W - 1) col = CAM_W - 1;
-                int disp = disp_frame[row * CAM_W + col];
-                if (disp > 0) {
+                if (row > CAM_H - 1) row = CAM_H - 1;
+                int disp = disp_frame[row * CAM_W + col]; // disparity value at pixel position
+                if (disp > 0) { // if there exists a disparity
                     for (const auto &r_feature : r_features) {
-                        float dy = y - r_feature.position.y;
-                        float dx = x - disp - r_feature.position.x;
-                        if (dy * dy + dx * dx <= PAIR_DIST_SQ) { //pair found
-                            lr_id_mapping[l_feature.id] = r_feature.id;
+                        float dy = y - r_feature.position.y; // difference between l and accredited to noise
+                        float dx = x - disp - r_feature.position.x; // difference = noise and also disparity (epipolar shift)
+                        if (dy * dy + dx * dx <= PAIR_DIST_SQ) { //pair found, aim for 95 percentile?
+                            lr_id_mapping[l_feature.id] = r_feature.id; // persists over multiple frames if feature is repeatedly found
+                            // same as left side
                             double dt = std::chrono::duration<double>(features_tp - prv_features_tp).count();
                             double vx = 0, vy = 0;
                             auto prv_pos = l_prv_features.find(l_feature.id);
@@ -455,15 +492,20 @@ int main(int argc, char **argv) {
                     }
                 }
             }
+            // logging every ccc=60 frames
             ccc++;
             if (ccc > 60) {
                 ccc = 0;
                 std::cout << c << " features\n";
             }
+            if (c < 10) printf("WARNING: too few features: %d\n", c);
+            // sending features
             if (imu_ok && c > 0) {
                 big_buf[0] = c;
                 sendto(ipc_sock, big_buf, 13*sizeof(double)*c+2*sizeof(double), 0, (struct sockaddr*)&features_addr, sizeof(struct sockaddr_un));
             }
+
+            // current frame moved to previous to make place for new frame
             l_prv_features = features;
             prv_features_tp = features_tp;
             r_prv_features.clear();
