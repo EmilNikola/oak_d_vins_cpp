@@ -1,3 +1,12 @@
+/* Not sure why i removed this, keeping it just in case
+-std::string get_cam_focal_pos (dai::CalibrationHandler calibData) {
+-    auto l_focal = calibData.getLensPosition(dai::CameraBoardSocket::CAM_B);
+-    auto r_focal = calibData.getLensPosition(dai::CameraBoardSocket::CAM_C);
+-    std::string lens_pos = "Left lens position: " + std::to_string(l_focal) + ", Right lens position: " + std::to_string(r_focal) + "\n";
+-    return lens_pos;
+-}
+*/
+
 #include <iostream>
 #include <thread>
 #include <chrono>
@@ -79,13 +88,6 @@ void calc_rect_cam_intri(dai::CalibrationHandler calibData, double* f, double* c
     *cy = p1.at<double>(1, 2);
 }
 
-std::string get_cam_focal_pos (dai::CalibrationHandler calibData) {
-    auto l_focal = calibData.getLensPosition(dai::CameraBoardSocket::CAM_B);
-    auto r_focal = calibData.getLensPosition(dai::CameraBoardSocket::CAM_C);
-    std::string lens_pos = "Left lens position: " + std::to_string(l_focal) + ", Right lens position: " + std::to_string(r_focal) + "\n";
-    return lens_pos;
-}
-
 int main(int argc, char **argv) {
     bool imu_ok = false;
     int ccc=0;
@@ -116,6 +118,7 @@ int main(int argc, char **argv) {
     // Define sources and outputs
     auto monoLeft = pipeline.create<dai::node::MonoCamera>();
     auto monoRight = pipeline.create<dai::node::MonoCamera>();
+    auto colorCam = pipeline.create<dai::node::ColorCamera>();
     auto featureTrackerLeft = pipeline.create<dai::node::FeatureTracker>();
     auto featureTrackerRight = pipeline.create<dai::node::FeatureTracker>();
     auto imu = pipeline.create<dai::node::IMU>();
@@ -125,11 +128,13 @@ int main(int argc, char **argv) {
     auto depth = pipeline.create<dai::node::StereoDepth>();
     auto xout_disp = pipeline.create<dai::node::XLinkOut>();
     auto xout_imu = pipeline.create<dai::node::XLinkOut>();
+    auto xout_focal = pipeline.create<dai::node::XLinkOut>(); //here
 
     xoutTrackedFeaturesLeft->setStreamName("trackedFeaturesLeft");
     xoutTrackedFeaturesRight->setStreamName("trackedFeaturesRight");
     xout_disp->setStreamName("disparity");
     xout_imu->setStreamName("imu");
+    xout_focal->setStreamName("focal"); //here
 
     // Properties
     monoLeft->setResolution(dai::MonoCameraProperties::SensorResolution::THE_400_P);
@@ -183,13 +188,31 @@ int main(int argc, char **argv) {
 
     depth->disparity.link(xout_disp->input);
     imu->out.link(xout_imu->input);
+    // Link color camera ISP output to focal XLinkOut so we get lens metadata
+    colorCam->setPreviewSize(CAM_W, CAM_H);
+    colorCam->setFps(20);
+    // Ensure 3A runs at camera framerate so AF metadata is available
+    colorCam->setIsp3aFps(20);
+    colorCam->isp.link(xout_focal->input); // send ISP frames from color camera to host
 
     // Connect to device and start pipeline
     dai::Device device(pipeline);
 
     std::cout << "Usb speed: " << device.getUsbSpeed() << "\n";
     std::cout << "Device name: " << device.getDeviceName() << " Product name: " << device.getProductName() << "\n";
+    // list cameras so i know which one to configure
     if (device.getDeviceName() == "OAK-D") dev_type = OAK_D; else dev_type = OAK_D_PRO;
+       std::cout << "Searching for all available devices...\n\n";
+
+    auto infos = dai::Device::getAllAvailableDevices();
+    if(infos.size() <= 0) {
+        std::cout << "Couldn't find any available devices.\n";
+        return -1;
+    }
+
+    for(auto& info : infos) {
+        std::cout << "Found device: " << info.name << " mxid: " << info.mxid << " state: " << info.state << std::endl;
+    }
 
     dai::CalibrationHandler calibData = device.readCalibration2();
     double f, cx, cy;
@@ -211,8 +234,11 @@ int main(int argc, char **argv) {
     auto outputFeaturesRightQueue = device.getOutputQueue("trackedFeaturesRight", 1, false);
     auto disp_queue = device.getOutputQueue("disparity", 1, false);
     auto imuQueue = device.getOutputQueue("imu", 5, false);
+    auto focalQueue = device.getOutputQueue("focal", 1, false); //here
 
     int l_seq = -1, r_seq = -2, disp_seq = -3;
+    int64_t prev_lens_pos = -1000; //here
+    //float prev_lens_pos_raw = -1.0f;//here
     std::vector<std::uint8_t> disp_frame;
     std::vector<dai::TrackedFeature> l_features, r_features;
     std::map<int, MyPoint2d> l_prv_features, r_prv_features;
@@ -248,6 +274,19 @@ int main(int argc, char **argv) {
             disp_seq = disp_data->getSequenceNum();
             disp_frame = disp_data->getData();
             //std::cout << "stereo " << disp_seq << " latency:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - disp_data->getTimestamp()).count() << " ms\n";
+        } else if (q_name == "focal") {
+            auto data = focalQueue->get<dai::ImgFrame>();
+            // sequence number available if needed
+            //int cam_seq = cam_frame->getSequenceNum();
+            // very likely wrong camera, need to run on camera 1st
+            int lens_pos = cam_frame->getLensPosition(dai::CameraBoardSocket::CAM_A); // 0..255 or -1 if not available
+            float lens_pos_raw = cam_frame->getLensPositionRaw(dai::CameraBoardSocket::CAM_A); // 0.0..1.0 or -1 if not available
+            // auto ts = cam_frame->getTimestampDevice();
+            if (lens_pos != prev_lens_pos) {
+                std::cout << " lens_pos=" << lens_pos << " lens_pos_raw=" << lens_pos_raw << "\n";
+                prev_lens_pos = lens_pos;
+                //prev_lens_pos_raw = lens_pos_raw;
+            }
         } else if (q_name == "imu") {
             auto imuData = imuQueue->get<dai::IMUData>();
             auto imuPackets = imuData->packets;
