@@ -79,6 +79,13 @@ void calc_rect_cam_intri(dai::CalibrationHandler calibData, double* f, double* c
     *cy = p1.at<double>(1, 2);
 }
 
+std::string get_cam_focal_pos (dai::CalibrationHandler calibData) {
+    auto l_focal = calibData.getLensPosition(dai::CameraBoardSocket::CAM_B);
+    auto r_focal = calibData.getLensPosition(dai::CameraBoardSocket::CAM_C);
+    std::string lens_pos = "Left lens position: " + std::to_string(l_focal) + ", Right lens position: " + std::to_string(r_focal) + "\n";
+    return lens_pos;
+}
+
 int main(int argc, char **argv) {
     bool imu_ok = false;
     int ccc=0;
