@@ -414,6 +414,10 @@ int main(int argc, char **argv) {
                         buf_ptr[6] = vy; // and y speed
                         // storing right feature positions instead of left
                         x = r_feature->second.x;
+                        y = r_feature->second.y;
+                        vx = 0;
+                        vy = 0;
+                        cur_un_x = r_inv_k11 * x + r_inv_k13;
                         cur_un_y = r_inv_k22 * y + r_inv_k23;
                         prv_pos = r_prv_features.find(r_feature->first);
                         if (prv_pos != r_prv_features.end()) {
