@@ -6,11 +6,12 @@
 -    return lens_pos;
 -}
 
-CONFIG: je mozne kameru provozovat ve 2x vyssim rozliseni?
+CONFIG: kamera rozliseni x fps - performance?
 CONFIG: current fps je 20 myslim ze to jde vytahnout k 30, target features also overit
 CONFIG: projit funkce a nastaveni Stereodepth nastaveni, to je asi to hlavni
 CONFIG: jak se pristupuje ke zpracovani dat z IMU
 CONFIG: report rate na senzorech porovnat s datasheetovymi specifikacemi, take rate jak jsou data odesilana nejak probrat
+CODE  : mixovat cout a printf je hloupost a hlavne to ani nefunguje
 
 asi budu moct odstranit jeden dev typ (zacatek main)
 mono xlink is missing
@@ -18,6 +19,9 @@ sedi fakt ty HW resources?
 filtry, confidence threshold
 subpixel???
 bitrate a fps chybi ako makra
+
+COLOR CAMERA:   IMX378  4056x3040   85@2024x1520
+MONO CAMERA:    OV9282  1280x800    THE_400_P: 255@640x400  THE_720_P: 143@1280x720 THE_800_P 129@1280x800  anti-banding mode*  3a algoritmy*
 */
 
 #include <iostream>
@@ -75,9 +79,9 @@ void calc_rect_cam_intri_extri(dai::CalibrationHandler calibData, double* f, dou
     auto imu_ext = calibData.getCameraToImuExtrinsics(dai::CameraBoardSocket::CAM_B, true);
     for (auto& row : imu_ext) {
         for (float val: row) {
-            printf("param: %f ", val);
+            std::cout << "param: " << val << "\n";
         }
-        printf("\n");
+        std::cout << "\n";
     }
 
     auto l_intrinsics = calibData.getCameraIntrinsics(dai::CameraBoardSocket::CAM_B, 640, 400);
@@ -251,7 +255,7 @@ int main(int argc, char **argv) {
     }
 
     for(auto& info : infos) {
-        std::cout << "Found device: " << info.name << " mxid: " << info.mxid << " state: " << info.state << std::endl;
+        std::cout << "Found device: " << info.name << " mxid: " << info.mxid << " state: " << info.state << "\n";
     }
 
     dai::CalibrationHandler calibData = device.readCalibration2();
@@ -410,10 +414,6 @@ int main(int argc, char **argv) {
                         buf_ptr[6] = vy; // and y speed
                         // storing right feature positions instead of left
                         x = r_feature->second.x;
-                        y = r_feature->second.y;
-                        vx = 0;
-                        vy = 0;
-                        cur_un_x = r_inv_k11 * x + r_inv_k13;
                         cur_un_y = r_inv_k22 * y + r_inv_k23;
                         prv_pos = r_prv_features.find(r_feature->first);
                         if (prv_pos != r_prv_features.end()) {
@@ -498,7 +498,7 @@ int main(int argc, char **argv) {
                 ccc = 0;
                 std::cout << c << " features\n";
             }
-            if (c < 10) printf("WARNING: too few features: %d\n", c);
+            if (c < 10) std::cout << "WARNING: too few features: " << c << "\n";
             // sending features
             if (imu_ok && c > 0) {
                 big_buf[0] = c;
@@ -518,7 +518,7 @@ int main(int argc, char **argv) {
     }
 
     close(ipc_sock);
-    printf("bye\n");
+    std::cout << "bye\n";
 
     return 0;
 }
