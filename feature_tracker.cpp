@@ -6,22 +6,22 @@
 -    return lens_pos;
 -}
 
-CONFIG: kamera rozliseni x fps - performance?
+CONFIG: kamera rozliseni & postprocessing x fps - performance?
 CONFIG: current fps je 20 myslim ze to jde vytahnout k 30, target features also overit
 CONFIG: projit funkce a nastaveni Stereodepth nastaveni, to je asi to hlavni
 CONFIG: jak se pristupuje ke zpracovani dat z IMU
 CONFIG: report rate na senzorech porovnat s datasheetovymi specifikacemi, take rate jak jsou data odesilana nejak probrat
-CODE  : mixovat cout a printf je hloupost a hlavne to ani nefunguje
 
 asi budu moct odstranit jeden dev typ (zacatek main)
 mono xlink is missing
 sedi fakt ty HW resources?
 filtry, confidence threshold
-subpixel???
 bitrate a fps chybi ako makra
 
 COLOR CAMERA:   IMX378  4056x3040   85@2024x1520
 MONO CAMERA:    OV9282  1280x800    THE_400_P: 255@640x400  THE_720_P: 143@1280x720 THE_800_P 129@1280x800  anti-banding mode*  3a algoritmy*
+
+latency with LR and subpixel according to documentation: 800P: 30.5ms 400P: 10.1ms
 */
 
 #include <iostream>
@@ -55,6 +55,7 @@ MONO CAMERA:    OV9282  1280x800    THE_400_P: 255@640x400  THE_720_P: 143@1280x
 #define CAM_H 400
 #define PAIR_DIST_SQ 9 // threshold macro
 #define MAXIMUM_FEATURES 118
+#define FPS 20
 
 // 2D point location values
 struct MyPoint2d {
@@ -76,13 +77,14 @@ void sig_func(int sig) {
 
 void calc_rect_cam_intri_extri(dai::CalibrationHandler calibData, double* f, double* cx, double* cy) {
     std::cout << "stereo baseline:" << calibData.getBaselineDistance(dai::CameraBoardSocket::CAM_B, dai::CameraBoardSocket::CAM_C, false) << " cm\n CAMERA TO IMU EXTRINSICS:\n";
-    auto imu_ext = calibData.getCameraToImuExtrinsics(dai::CameraBoardSocket::CAM_B, true);
+    // to make this available, IMU calibration data would need to be available at the time of calling this function, it seems unimportant at this moment
+    /*auto imu_ext = calibData.getCameraToImuExtrinsics(dai::CameraBoardSocket::CAM_B, true);
     for (auto& row : imu_ext) {
         for (float val: row) {
             std::cout << "param: " << val << "\n";
         }
         std::cout << "\n";
-    }
+    }*/
 
     auto l_intrinsics = calibData.getCameraIntrinsics(dai::CameraBoardSocket::CAM_B, 640, 400);
     float data[9];
@@ -182,10 +184,10 @@ int main(int argc, char **argv) {
     // Properties
     monoLeft->setResolution(dai::MonoCameraProperties::SensorResolution::THE_400_P);
     monoLeft->setCamera("left");
-    monoLeft->setFps(20);
+    monoLeft->setFps(FPS);
     monoRight->setResolution(dai::MonoCameraProperties::SensorResolution::THE_400_P);
     monoRight->setCamera("right");
-    monoRight->setFps(20);
+    monoRight->setFps(FPS);
 
     featureTrackerLeft->initialConfig.setNumTargetFeatures(16*5);
     featureTrackerRight->initialConfig.setNumTargetFeatures(16*5);
@@ -204,7 +206,8 @@ int main(int argc, char **argv) {
     depth->initialConfig.setMedianFilter(dai::MedianFilter::KERNEL_5x5);
     depth->setLeftRightCheck(true);
     depth->setExtendedDisparity(false);
-    depth->setSubpixel(false);
+    depth->setSubpixel(true);
+    depth->setSubpixelFractionalBits(3); 
     depth->setDepthAlign(dai::RawStereoDepthConfig::AlgorithmControl::DepthAlign::RECTIFIED_LEFT);
     depth->setAlphaScaling(0);
 
@@ -238,25 +241,25 @@ int main(int argc, char **argv) {
     // colorCam->setIsp3aFps(20);
     // colorCam->isp.link(xout_focal->input); // send ISP frames from color camera to host
 
+    // list cameras so i know which one to configure
+    std::cout << "Searching for all available devices...\n\n";
+    auto infos = dai::Device::getAllAvailableDevices();
+    if(infos.empty()) {
+        std::cout << "Couldn't find any available devices.\n";
+        return -1;
+    }
+    for(auto& info : infos) {
+        std::cout << "Found device: " << info.name << " mxid: " << info.mxid << " state: " << info.state << "\n";
+    }
+
     // Connect to device and start pipeline
     dai::Device device(pipeline);
 
     // device parameters readout
     std::cout << "Usb speed: " << device.getUsbSpeed() << "\n";
     std::cout << "Device name: " << device.getDeviceName() << " Product name: " << device.getProductName() << "\n";
-    // list cameras so i know which one to configure
+
     if (device.getDeviceName() == "OAK-D") dev_type = OAK_D; else dev_type = OAK_D_PRO;
-       std::cout << "Searching for all available devices...\n\n";
-
-    auto infos = dai::Device::getAllAvailableDevices();
-    if(infos.size() <= 0) {
-        std::cout << "Couldn't find any available devices.\n";
-        return -1;
-    }
-
-    for(auto& info : infos) {
-        std::cout << "Found device: " << info.name << " mxid: " << info.mxid << " state: " << info.state << "\n";
-    }
 
     dai::CalibrationHandler calibData = device.readCalibration2();
     double f, cx, cy;
@@ -332,7 +335,8 @@ int main(int argc, char **argv) {
         } else if (q_name == "disparity") {
             auto disp_data = disp_queue->get<dai::ImgFrame>();
             disp_seq = disp_data->getSequenceNum();
-            disp_frame = disp_data->getData(); // return only disparity data from frame
+            auto disp_frame = disp_data->getData(); // return only disparity data from frame
+            uint16_t* pDisp_frame16 = (uint16_t*)disp_frame.data();
             //std::cout << "stereo " << disp_seq << " latency:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - disp_data->getTimestamp()).count() << " ms\n";
         /*} else if (q_name == "focal") {
             auto data = focalQueue->get<dai::ImgFrame>();
@@ -445,7 +449,7 @@ int main(int argc, char **argv) {
                 // setting bounds for possible values
                 if (col > CAM_W - 1) col = CAM_W - 1;
                 if (row > CAM_H - 1) row = CAM_H - 1;
-                int disp = disp_frame[row * CAM_W + col]; // disparity value at pixel position
+                int disp = pDisp_frame16[row * CAM_W + col] / 8.0f; // disparity value at pixel position
                 if (disp > 0) { // if there exists a disparity
                     for (const auto &r_feature : r_features) {
                         float dy = y - r_feature.position.y; // difference between l and accredited to noise
