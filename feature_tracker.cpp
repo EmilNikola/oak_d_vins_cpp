@@ -86,7 +86,7 @@ void calc_rect_cam_intri_extri(dai::CalibrationHandler calibData, double* f, dou
         std::cout << "\n";
     }*/
 
-    auto l_intrinsics = calibData.getCameraIntrinsics(dai::CameraBoardSocket::CAM_B, 640, 400);
+    auto l_intrinsics = calibData.getCameraIntrinsics(dai::CameraBoardSocket::CAM_B, CAM_W, CAM_H);
     float data[9];
     int i = -1;
     for (auto row : l_intrinsics) {
@@ -96,7 +96,7 @@ void calc_rect_cam_intri_extri(dai::CalibrationHandler calibData, double* f, dou
     }
     cv::Mat l_m = cv::Mat(3, 3, CV_32FC1, data); // 3x3 matrix of instrinsics as 32bit float
 
-    auto r_intrinsics = calibData.getCameraIntrinsics(dai::CameraBoardSocket::CAM_C, 640, 400);
+    auto r_intrinsics = calibData.getCameraIntrinsics(dai::CameraBoardSocket::CAM_C, CAM_W, CAM_H);
     i = -1;
     for (auto row : r_intrinsics) {
         for (auto val : row) {
@@ -114,7 +114,7 @@ void calc_rect_cam_intri_extri(dai::CalibrationHandler calibData, double* f, dou
     cv::Mat t = (cv::Mat_<double>(3,1) << extrinsics[0][3], extrinsics[1][3], extrinsics[2][3]);
     std::cout << "stereo extrinsics\n" << r << "\n" << t << "\n"; // additional temporary(?) printout
     cv::Mat r1, r2, p1, p2, q;
-    cv::stereoRectify(l_m, l_d, r_m, r_d, cv::Size(640, 400), r, t, r1, r2, p1, p2, q, cv::CALIB_ZERO_DISPARITY, 0); // rectification transforms for stereo images alignment
+    cv::stereoRectify(l_m, l_d, r_m, r_d, cv::Size(CAM_W, CAM_H), r, t, r1, r2, p1, p2, q, cv::CALIB_ZERO_DISPARITY, 0); // rectification transforms for stereo images alignment
 
     std::cout << "P1\n" << p1 << "\nP2\n" << p2 << "\n";
 
@@ -265,8 +265,8 @@ int main(int argc, char **argv) {
     double f, cx, cy;
     float baseline = calibData.getBaselineDistance(dai::CameraBoardSocket::CAM_B, dai::CameraBoardSocket::CAM_C, false) * 0.01f;
     calc_rect_cam_intri_extri(calibData, &f, &cx, &cy);
-    float hfov = 2 * atanf(640 / (2 * f));
-    float vfov = 2 * atanf(400 / (2 * f));
+    float hfov = 2 * atanf(CAM_W / (2 * f));
+    float vfov = 2 * atanf(CAM_H / (2 * f));
     std::cout << "stereo baseline:" << baseline << " m, f:" << f << " px, cx:" << cx << ", cy:" << cy << " hfov:" << hfov * 180 / M_PI << " degrees, vfov:" << vfov * 180 / M_PI << " degrees\n";
 
     // variables for affine transformation
@@ -302,7 +302,8 @@ int main(int argc, char **argv) {
     // float prev_lens_pos_raw = -1.0f;//here
 
     // tools for variable processing
-    std::vector<std::uint8_t> disp_frame; // disparity frame
+    std::vector<std::uint8_t> disp_frame; // disparity frame data
+    uint16_t* pDisp_frame16 = nullptr; // pointer to transdormed disparity frame data
     std::vector<dai::TrackedFeature> l_features, r_features; // vectors containing features
     std::map<int, MyPoint2d> l_prv_features, r_prv_features; // vectors containing features from previous frame
     std::map<int, dai::Point2f> r_cur_features; // right image current features indexed map
@@ -335,8 +336,8 @@ int main(int argc, char **argv) {
         } else if (q_name == "disparity") {
             auto disp_data = disp_queue->get<dai::ImgFrame>();
             disp_seq = disp_data->getSequenceNum();
-            auto disp_frame = disp_data->getData(); // return only disparity data from frame
-            uint16_t* pDisp_frame16 = (uint16_t*)disp_frame.data();
+            disp_frame = disp_data->getData(); // return only disparity data from frame
+            pDisp_frame16 = (uint16_t*)disp_frame.data();
             //std::cout << "stereo " << disp_seq << " latency:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - disp_data->getTimestamp()).count() << " ms\n";
         /*} else if (q_name == "focal") {
             auto data = focalQueue->get<dai::ImgFrame>();
@@ -444,12 +445,12 @@ int main(int argc, char **argv) {
                     }
                 }
                 // rounding down 
-                float col = roundf(x);
-                float row = roundf(y);
+                int col = roundf(x);
+                int row = roundf(y);
                 // setting bounds for possible values
                 if (col > CAM_W - 1) col = CAM_W - 1;
                 if (row > CAM_H - 1) row = CAM_H - 1;
-                int disp = pDisp_frame16[row * CAM_W + col] / 8.0f; // disparity value at pixel position
+                float disp = pDisp_frame16[row * CAM_W + col] / 8.0f; // disparity value at pixel position
                 if (disp > 0) { // if there exists a disparity
                     for (const auto &r_feature : r_features) {
                         float dy = y - r_feature.position.y; // difference between l and accredited to noise
