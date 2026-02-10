@@ -1,22 +1,11 @@
-/* Not sure why i removed this, keeping it just in case
--std::string get_cam_focal_pos (dai::CalibrationHandler calibData) {
--    auto l_focal = calibData.getLensPosition(dai::CameraBoardSocket::CAM_B);
--    auto r_focal = calibData.getLensPosition(dai::CameraBoardSocket::CAM_C);
--    std::string lens_pos = "Left lens position: " + std::to_string(l_focal) + ", Right lens position: " + std::to_string(r_focal) + "\n";
--    return lens_pos;
--}
+/*
+FPS(kamera, gyroskop a akcelerometr)xPERFORMANCE(filtry, NO of features, disparity)
 
-CONFIG: kamera rozliseni & postprocessing x fps - performance?
-CONFIG: current fps je 20 myslim ze to jde vytahnout k 30, target features also overit
-CONFIG: projit funkce a nastaveni Stereodepth nastaveni, to je asi to hlavni
+CONFIG: projit funkce a nastaveni Stereodepth nastaveni, to je asi to hlavni - filtry, confidence threshold
 CONFIG: jak se pristupuje ke zpracovani dat z IMU
 CONFIG: report rate na senzorech porovnat s datasheetovymi specifikacemi, take rate jak jsou data odesilana nejak probrat
-
-asi budu moct odstranit jeden dev typ (zacatek main)
-mono xlink is missing
-sedi fakt ty HW resources?
-filtry, confidence threshold
-bitrate a fps chybi ako makra
+CONFIG: ktera z tech mereni latenci ukazuje to co chci?
+CONFIG: jiz je pravdepodobne vse optimalni ale nechci odesilat jeste nejake jine zpravy nez ted?
 
 COLOR CAMERA:   IMX378  4056x3040   85@2024x1520
 MONO CAMERA:    OV9282  1280x800    THE_400_P: 255@640x400  THE_720_P: 143@1280x720 THE_800_P 129@1280x800  anti-banding mode*  3a algoritmy*
@@ -126,7 +115,6 @@ void calc_rect_cam_intri_extri(dai::CalibrationHandler calibData, double* f, dou
 int main(int argc, char **argv) {
     bool imu_ok = false;
     int ccc=0; // number of frames
-    enum DEV_TYPE {OAK_D, OAK_D_PRO} dev_type;
 
     // terminate process by calling SIGINT(Ctrl-C)
     struct sigaction act;
@@ -259,8 +247,6 @@ int main(int argc, char **argv) {
     std::cout << "Usb speed: " << device.getUsbSpeed() << "\n";
     std::cout << "Device name: " << device.getDeviceName() << " Product name: " << device.getProductName() << "\n";
 
-    if (device.getDeviceName() == "OAK-D") dev_type = OAK_D; else dev_type = OAK_D_PRO;
-
     dai::CalibrationHandler calibData = device.readCalibration2();
     double f, cx, cy;
     float baseline = calibData.getBaselineDistance(dai::CameraBoardSocket::CAM_B, dai::CameraBoardSocket::CAM_C, false) * 0.01f;
@@ -315,6 +301,9 @@ int main(int argc, char **argv) {
     //https://discuss.luxonis.com/d/3484-getqueueevent-takes-much-additional-time/7
     //device.getQueueEvents();
 
+    float l_sum = 0.0, r_sum = 0.0, disp_sum = 0.0;
+    int l_count = 0, r_count = 0, disp_count = 0;
+
     while(camera_run) {
         auto q_name = device.getQueueEvent();
 
@@ -323,12 +312,16 @@ int main(int argc, char **argv) {
             l_features = data->trackedFeatures;
             l_seq = data->getSequenceNum(); // retrieve sequence number
             features_tp = data->getTimestampDevice(); // timestamp from camera
-            std::cout << "l ft " << l_seq << " latency:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - features_tp).count() << " ms\n";
+            //std::cout << "LEFT ft " << l_seq << " latency:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - features_tp).count() << " ms\n";
+            l_sum += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - features_tp).count();
+            l_count += 1;
         } else if (q_name == "trackedFeaturesRight") {
             auto data = outputFeaturesRightQueue->get<dai::TrackedFeatures>();
             r_features = data->trackedFeatures;
             r_seq = data->getSequenceNum();
-            std::cout << "r ft " << r_seq << " latency:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - data->getTimestamp()).count() << " ms\n";
+            //std::cout << "RIGHT ft " << r_seq << " latency:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - data->getTimestamp()).count() << " ms\n";
+            r_sum += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - data->getTimestamp()).count();
+            r_count += 1;
             r_cur_features.clear();
             for (const auto &feature : r_features) {
                 r_cur_features[feature.id] = feature.position; // map features to indexes
@@ -338,7 +331,9 @@ int main(int argc, char **argv) {
             disp_seq = disp_data->getSequenceNum();
             disp_frame = disp_data->getData(); // return only disparity data from frame
             pDisp_frame16 = (uint16_t*)disp_frame.data();
-            //std::cout << "stereo " << disp_seq << " latency:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - disp_data->getTimestamp()).count() << " ms\n";
+            // std::cout << "stereo " << disp_seq << " latency:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - disp_data->getTimestamp()).count() << " ms\n";
+            disp_sum += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - disp_data->getTimestamp()).count();
+            disp_count += 1;
         /*} else if (q_name == "focal") {
             auto data = focalQueue->get<dai::ImgFrame>();
             // sequence number available if needed
@@ -361,21 +356,12 @@ int main(int argc, char **argv) {
                 //std::cout << "imu latency, acc:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - acc.getTimestamp()).count() << " ms, gyro:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - gyro.getTimestamp()).count() << " ms\n";
                 big_buf[0] = std::chrono::duration<double>(gyro.getTimestampDevice().time_since_epoch()).count();
                 // translate to ros frame, easier to understand in rviz
-                if (dev_type == OAK_D) {
-                    big_buf[1] = acc.z;
-                    big_buf[2] = acc.y;
-                    big_buf[3] = -acc.x;
-                    big_buf[4] = gyro.z;
-                    big_buf[5] = gyro.y;
-                    big_buf[6] = -gyro.x;
-                } else {
-                    big_buf[1] = -acc.z;
-                    big_buf[2] = -acc.y;
-                    big_buf[3] = -acc.x;
-                    big_buf[4] = -gyro.z;
-                    big_buf[5] = -gyro.y;
-                    big_buf[6] = -gyro.x;
-                }
+                big_buf[1] = -acc.z;
+                big_buf[2] = -acc.y;
+                big_buf[3] = -acc.x;
+                big_buf[4] = -gyro.z;
+                big_buf[5] = -gyro.y;
+                big_buf[6] = -gyro.x;
                 sendto(ipc_sock, big_buf, 7*sizeof(double), 0, (struct sockaddr*)&imu_addr, sizeof(struct sockaddr_un));
             }
             if (!imu_ok) {
@@ -506,6 +492,15 @@ int main(int argc, char **argv) {
             if (ccc > 60) {
                 ccc = 0;
                 std::cout << c << " features\n";
+                std::cout << "average latency LEFT: " << l_sum/l_count << " ms\n";
+                std::cout << "average latency RIGHT: " << r_sum/r_count << " ms\n";
+                std::cout << "average latency DISPARITY" << disp_sum/disp_count << " ms\n";
+                l_sum = 0.0;
+                r_sum = 0.0;
+                disp_sum = 0.0;
+                l_count = 0;
+                r_count = 0;
+                disp_count = 0;
             }
             if (c < 10) std::cout << "WARNING: too few features: " << c << "\n";
             // sending features
