@@ -157,6 +157,7 @@ int main(int argc, char **argv) {
 
     auto xoutTrackedFeaturesLeft = pipeline.create<dai::node::XLinkOut>();
     auto xoutTrackedFeaturesRight = pipeline.create<dai::node::XLinkOut>();
+    auto xinTrackedFeaturesConfig = pipeline.create<dai::node::XLinkIn>();
     auto depth = pipeline.create<dai::node::StereoDepth>();
     auto xout_disp = pipeline.create<dai::node::XLinkOut>();
     auto xout_imu = pipeline.create<dai::node::XLinkOut>();
@@ -165,6 +166,7 @@ int main(int argc, char **argv) {
     // specify some stream names over which nodes receive their data
     xoutTrackedFeaturesLeft->setStreamName("trackedFeaturesLeft");
     xoutTrackedFeaturesRight->setStreamName("trackedFeaturesRight");
+    xinTrackedFeaturesConfig->setStreamName("trackedFeaturesConfig");
     xout_disp->setStreamName("disparity");
     xout_imu->setStreamName("imu");
     //xout_focal->setStreamName("focal"); //here
@@ -179,6 +181,13 @@ int main(int argc, char **argv) {
 
     featureTrackerLeft->initialConfig.setNumTargetFeatures(16*5);
     featureTrackerRight->initialConfig.setNumTargetFeatures(16*5);
+    // Initialize motion estimator to hardware-accelerated mode (can be changed at runtime via trackedFeaturesConfig)
+    {
+        auto ftCfg = featureTrackerLeft->initialConfig.get();
+        ftCfg.motionEstimator.type = dai::FeatureTrackerConfig::MotionEstimator::Type::HW_MOTION_ESTIMATION;
+        featureTrackerLeft->initialConfig.set(ftCfg);
+        featureTrackerRight->initialConfig.set(ftCfg);
+    }
     /*dai::RawFeatureTrackerConfig config = featureTrackerLeft->initialConfig.get();
     config.cornerDetector.numMaxFeatures = 100;
     featureTrackerLeft->initialConfig.set(config);
@@ -222,6 +231,9 @@ int main(int argc, char **argv) {
 
     depth->disparity.link(xout_disp->input);
     imu->out.link(xout_imu->input);
+    // Allow runtime updates to FeatureTracker configuration for both left and right
+    xinTrackedFeaturesConfig->out.link(featureTrackerLeft->inputConfig);
+    xinTrackedFeaturesConfig->out.link(featureTrackerRight->inputConfig);
     // Link color camera ISP output to focal XLinkOut so we get lens metadata
     // colorCam->setPreviewSize(CAM_W, CAM_H);
     // colorCam->setFps(20);
@@ -280,6 +292,8 @@ int main(int argc, char **argv) {
     auto outputFeaturesRightQueue = device.getOutputQueue("trackedFeaturesRight", 1, false);
     auto disp_queue = device.getOutputQueue("disparity", 1, false);
     auto imuQueue = device.getOutputQueue("imu", 5, false);
+    // Input queue to send runtime FeatureTracker config updates (optional)
+    auto inputFeatureTrackerConfigQueue = device.getInputQueue("trackedFeaturesConfig");
     // auto focalQueue = device.getOutputQueue("focal", 1, false); //here
 
     // sequence numbers initialisation
@@ -291,10 +305,10 @@ int main(int argc, char **argv) {
     std::vector<std::uint8_t> disp_frame; // disparity frame data
     uint16_t* pDisp_frame16 = nullptr; // pointer to transdormed disparity frame data
     std::vector<dai::TrackedFeature> l_features, r_features; // vectors containing features
-    std::map<int, MyPoint2d> l_prv_features, r_prv_features; // vectors containing features from previous frame
-    std::map<int, dai::Point2f> r_cur_features; // right image current features indexed map
+    std::unordered_map<int, dai::Point2f> l_prv_features, r_prv_features; // vectors containing features from previous frame
+    std::unordered_map<int, dai::Point2f> r_cur_features; // right image current features indexed map
     std::chrono::time_point<std::chrono::steady_clock, std::chrono::steady_clock::duration> features_tp, prv_features_tp; // timestamps of frames
-    std::map<int, int> lr_id_mapping; // features detected in left image paired to features in right
+    std::unordered_map<int, int> lr_id_mapping; // features detected in left image paired to features in right
 
     // Clear queue events
     //jakaskerl suggest remove this line
@@ -375,7 +389,7 @@ int main(int argc, char **argv) {
             l_seq = -1;
             r_seq = -2;
             disp_seq = -3;
-            std::map<int , MyPoint2d> features;
+            std::unordered_map<int , dai::Point2f> features;
             int c = 0;
             big_buf[1] = std::chrono::duration<double>(features_tp.time_since_epoch()).count(); // duration between epoch and timestamp of frame expressed in seconds
             double* buf_ptr = big_buf + 2; // first two slots are occupied with timestamps
@@ -384,7 +398,7 @@ int main(int argc, char **argv) {
                 float y = l_feature.position.y;
                 double cur_un_x = l_inv_k11 * x + l_inv_k13; // normalised current x position
                 double cur_un_y = l_inv_k22 * y + l_inv_k23; // normalised current y position
-                features[l_feature.id] = MyPoint2d(cur_un_x, cur_un_y); // map of normalised values
+                features[l_feature.id] = dai::Point2f(static_cast<float>(cur_un_x), static_cast<float>(cur_un_y)); // map of normalised values
                 auto lr_id = lr_id_mapping.find(l_feature.id); // check if feature is one that has a match
                 if (lr_id != lr_id_mapping.end()) { // checks if previous line found instance
                     auto r_feature = r_cur_features.find(lr_id->second); // tries to find that feature in current right side
@@ -494,7 +508,7 @@ int main(int argc, char **argv) {
                 std::cout << c << " features\n";
                 std::cout << "average latency LEFT: " << l_sum/l_count << " ms\n";
                 std::cout << "average latency RIGHT: " << r_sum/r_count << " ms\n";
-                std::cout << "average latency DISPARITY" << disp_sum/disp_count << " ms\n";
+                std::cout << "average latency DISPARITY: " << disp_sum/disp_count << " ms\n";
                 l_sum = 0.0;
                 r_sum = 0.0;
                 disp_sum = 0.0;
@@ -514,7 +528,10 @@ int main(int argc, char **argv) {
             prv_features_tp = features_tp;
             r_prv_features.clear();
             for (const auto &r_feature : r_features) {
-                r_prv_features[r_feature.id] = MyPoint2d(r_inv_k11 * r_feature.position.x + r_inv_k13, r_inv_k22 * r_feature.position.y + r_inv_k23);
+                r_prv_features[r_feature.id] = dai::Point2f(
+                    static_cast<float>(r_inv_k11 * r_feature.position.x + r_inv_k13),
+                    static_cast<float>(r_inv_k22 * r_feature.position.y + r_inv_k23)
+                );
             }
             //auto t2 = std::chrono::steady_clock::now();
             //std::cout << pp_msg.points.size() << " points, " << std::chrono::duration<float, std::milli>(t2-t1).count() << " ms\n";
