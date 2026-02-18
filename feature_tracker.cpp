@@ -1,11 +1,13 @@
 /*
 FPS(kamera, gyroskop a akcelerometr)xPERFORMANCE(filtry, NO of features, disparity)
 
-CONFIG: projit funkce a nastaveni Stereodepth nastaveni, to je asi to hlavni - filtry, confidence threshold
+CONFIG: initialConfig logging, parametry - tracker type, treshol (a moznost runtime zmeny)
 CONFIG: jak se pristupuje ke zpracovani dat z IMU
 CONFIG: report rate na senzorech porovnat s datasheetovymi specifikacemi, take rate jak jsou data odesilana nejak probrat
 CONFIG: ktera z tech mereni latenci ukazuje to co chci?
-CONFIG: jiz je pravdepodobne vse optimalni ale nechci odesilat jeste nejake jine zpravy nez ted?
+CONFIG: openCV okenko
+CONFIG: passthrough framy pro debug
+CONFIG: safe indices; cast row/col to int — keepconsistent across for new pixel reads to avoid UB with uint16_t* indexing.
 
 COLOR CAMERA:   IMX378  4056x3040   85@2024x1520
 MONO CAMERA:    OV9282  1280x800    THE_400_P: 255@640x400  THE_720_P: 143@1280x720 THE_800_P 129@1280x800  anti-banding mode*  3a algoritmy*
@@ -14,19 +16,16 @@ latency with LR and subpixel according to documentation: 800P: 30.5ms 400P: 10.1
 */
 
 #include <iostream>
-#include <thread>
 #include <chrono>
 #include <math.h>
+#include <vector>
+#include <cstdint>
 
-#include <arpa/inet.h> // definitions for internet operations
-#include <errno.h> // error indication
 #include <stdio.h>
 #include <sys/types.h> // data types for working with processes
 #include <sys/socket.h> // communication endpoints
 #include <unistd.h> // posix api
 #include <string.h>
-#include <sys/stat.h> // file metadata
-#include <fcntl.h> // file descriptors manipulation
 #include <sys/un.h> // unix sockets
 #include <signal.h> // signal handling
 
@@ -37,7 +36,6 @@ latency with LR and subpixel according to documentation: 800P: 30.5ms 400P: 10.1
 #include "depthai/depthai.hpp"
 #include "deque"
 #include "unordered_map"
-#include "unordered_set"
 
 // camera parameters as specified by THE_400_P
 #define CAM_W 640
@@ -47,15 +45,15 @@ latency with LR and subpixel according to documentation: 800P: 30.5ms 400P: 10.1
 #define FPS 20
 
 // 2D point location values
-struct MyPoint2d {
-    double x = 0;
-    double y = 0;
-    MyPoint2d() {}
-    MyPoint2d(double px, double py) {
-        x = px;
-        y = py;
-    }
-};
+// struct MyPoint2d {
+//     double x = 0;
+//     double y = 0;
+//     MyPoint2d() {}
+//     MyPoint2d(double px, double py) {
+//         x = px;
+//         y = py;
+//     }
+// };
 
 double big_buf[12*1024/sizeof(double)]; // buffer size is just "big enough"
 bool camera_run = true;
@@ -288,9 +286,9 @@ int main(int argc, char **argv) {
 
     // Output queues used to receive the results
     // 3rd argument when false specifies that old messages are overwritten when the queue is full
-    auto outputFeaturesLeftQueue = device.getOutputQueue("trackedFeaturesLeft", 1, false);
-    auto outputFeaturesRightQueue = device.getOutputQueue("trackedFeaturesRight", 1, false);
-    auto disp_queue = device.getOutputQueue("disparity", 1, false);
+    auto outputFeaturesLeftQueue = device.getOutputQueue("trackedFeaturesLeft", 4, false); // size of queue, increased slightly to reduce jitter
+    auto outputFeaturesRightQueue = device.getOutputQueue("trackedFeaturesRight", 4, false);
+    auto disp_queue = device.getOutputQueue("disparity", 4, false);
     auto imuQueue = device.getOutputQueue("imu", 5, false);
     // Input queue to send runtime FeatureTracker config updates (optional)
     auto inputFeatureTrackerConfigQueue = device.getInputQueue("trackedFeaturesConfig");
