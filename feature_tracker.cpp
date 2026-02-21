@@ -8,6 +8,17 @@ CONFIG: ktera z tech mereni latenci ukazuje to co chci?
 CONFIG: openCV okenko
 CONFIG: passthrough framy pro debug
 CONFIG: safe indices; cast row/col to int — keepconsistent across for new pixel reads to avoid UB with uint16_t* indexing.
+CONFIG: jestli se CV rectification projevi jako zbytecna, bude odstranena pro rychlejsi loop
+
+upravit sirku toho bufferu aby davala smysl
+odstranit imu_ok? asi k nicemu
+zkusit stream misto dgram?
+current depth a initialConfig nastavovani duplicita
+je float baseline redundantni?
+
+
+kodek vicisteny po while loop!!!!!!!!
+
 
 COLOR CAMERA:   IMX378  4056x3040   85@2024x1520
 MONO CAMERA:    OV9282  1280x800    THE_400_P: 255@640x400  THE_720_P: 143@1280x720 THE_800_P 129@1280x800  anti-banding mode*  3a algoritmy*
@@ -17,10 +28,10 @@ latency with LR and subpixel according to documentation: 800P: 30.5ms 400P: 10.1
 
 #include <iostream>
 #include <chrono>
-#include <math.h>
 #include <vector>
 #include <cstdint>
 
+#include <math.h>
 #include <stdio.h>
 #include <sys/types.h> // data types for working with processes
 #include <sys/socket.h> // communication endpoints
@@ -41,8 +52,11 @@ latency with LR and subpixel according to documentation: 800P: 30.5ms 400P: 10.1
 #define CAM_W 640
 #define CAM_H 400
 #define PAIR_DIST_SQ 9 // threshold macro
+#define MIN_FEATURES 10
+#define TARGET_FEATURES 80
 #define MAXIMUM_FEATURES 118
 #define FPS 20
+#define FRAC_BITS_N 3
 
 // 2D point location values
 // struct MyPoint2d {
@@ -56,14 +70,20 @@ latency with LR and subpixel according to documentation: 800P: 30.5ms 400P: 10.1
 // };
 
 double big_buf[12*1024/sizeof(double)]; // buffer size is just "big enough"
-bool camera_run = true;
 
+bool camera_run = true;
 void sig_func(int sig) {
     camera_run = false;
 }
 
 void calc_rect_cam_intri_extri(dai::CalibrationHandler calibData, double* f, double* cx, double* cy) {
-    std::cout << "stereo baseline:" << calibData.getBaselineDistance(dai::CameraBoardSocket::CAM_B, dai::CameraBoardSocket::CAM_C, false) << " cm\n CAMERA TO IMU EXTRINSICS:\n";
+    
+    float data[9]; // left and right intrinsics
+
+    // bool uses translation information from board design data
+    std::cout << "stereo baseline:" << calibData.getBaselineDistance(dai::CameraBoardSocket::CAM_B, dai::CameraBoardSocket::CAM_C, false);
+    std::cout << "stereo baseline:" << calibData.getBaselineDistance(dai::CameraBoardSocket::CAM_B, dai::CameraBoardSocket::CAM_C, true) << " cm\n CAMERA TO IMU EXTRINSICS:\n";
+    
     // to make this available, IMU calibration data would need to be available at the time of calling this function, it seems unimportant at this moment
     /*auto imu_ext = calibData.getCameraToImuExtrinsics(dai::CameraBoardSocket::CAM_B, true);
     for (auto& row : imu_ext) {
@@ -74,37 +94,38 @@ void calc_rect_cam_intri_extri(dai::CalibrationHandler calibData, double* f, dou
     }*/
 
     auto l_intrinsics = calibData.getCameraIntrinsics(dai::CameraBoardSocket::CAM_B, CAM_W, CAM_H);
-    float data[9];
-    int i = -1;
+    int i = 0;
     for (auto row : l_intrinsics) {
         for (auto val : row) {
-            data[++i] = val;
+            data[i++] = val;
         }
     }
-    cv::Mat l_m = cv::Mat(3, 3, CV_32FC1, data); // 3x3 matrix of instrinsics as 32bit float
+    cv::Mat intri_l = cv::Mat(3, 3, CV_32FC1, data); // 3x3 matrix of instrinsics as 32bit float
 
     auto r_intrinsics = calibData.getCameraIntrinsics(dai::CameraBoardSocket::CAM_C, CAM_W, CAM_H);
-    i = -1;
+    i = 0;
     for (auto row : r_intrinsics) {
         for (auto val : row) {
-            data[++i] = val;
+            data[i++] = val;
         }
     }
-    cv::Mat r_m = cv::Mat(3, 3, CV_32FC1, data); // 3x3 matrix of instrinsics as 32bit float
-    std::cout << "camera intrinsics left\n" << l_m << "\n right \n" << r_m << "\n"; // additional temporary(?) printout
+    cv::Mat intri_r = cv::Mat(3, 3, CV_32FC1, data); // 3x3 matrix of instrinsics as 32bit float
 
-    auto l_d = calibData.getDistortionCoefficients(dai::CameraBoardSocket::CAM_B);
-    auto r_d = calibData.getDistortionCoefficients(dai::CameraBoardSocket::CAM_C);
+    std::cout << "camera intrinsics left\n" << intri_l << "\n right \n" << intri_r << "\n"; // additional temporary(?) printout
+
+    auto dist_l = calibData.getDistortionCoefficients(dai::CameraBoardSocket::CAM_B);
+    auto dist_r = calibData.getDistortionCoefficients(dai::CameraBoardSocket::CAM_C);
+    
     auto extrinsics = calibData.getCameraExtrinsics(dai::CameraBoardSocket::CAM_B, dai::CameraBoardSocket::CAM_C);
-
     cv::Mat r = (cv::Mat_<double>(3,3) << extrinsics[0][0], extrinsics[0][1], extrinsics[0][2], extrinsics[1][0], extrinsics[1][1], extrinsics[1][2], extrinsics[2][0], extrinsics[2][1], extrinsics[2][2]);
     cv::Mat t = (cv::Mat_<double>(3,1) << extrinsics[0][3], extrinsics[1][3], extrinsics[2][3]);
     std::cout << "stereo extrinsics\n" << r << "\n" << t << "\n"; // additional temporary(?) printout
+    
     cv::Mat r1, r2, p1, p2, q;
-    cv::stereoRectify(l_m, l_d, r_m, r_d, cv::Size(CAM_W, CAM_H), r, t, r1, r2, p1, p2, q, cv::CALIB_ZERO_DISPARITY, 0); // rectification transforms for stereo images alignment
-
+    cv::stereoRectify(intri_l, dist_l, intri_r, dist_r, cv::Size(CAM_W, CAM_H), r, t, r1, r2, p1, p2, q, cv::CALIB_ZERO_DISPARITY, 0); // rectification transforms for stereo images alignment
+    // p1 and p2 are projection matrices in rectified coordinate system for cameras
+    // https://docs.opencv.org/3.4/d9/d0c/group__calib3d.html#ga617b1685d4059c6040827800e72ad2b6
     std::cout << "P1\n" << p1 << "\nP2\n" << p2 << "\n";
-
     *f = p1.at<double>(0, 0);
     *cx = p1.at<double>(0, 2);
     *cy = p1.at<double>(1, 2);
@@ -112,7 +133,7 @@ void calc_rect_cam_intri_extri(dai::CalibrationHandler calibData, double* f, dou
 
 int main(int argc, char **argv) {
     bool imu_ok = false;
-    int ccc=0; // number of frames
+    int num_frames=0; // number of frames
 
     // terminate process by calling SIGINT(Ctrl-C)
     struct sigaction act;
@@ -120,7 +141,8 @@ int main(int argc, char **argv) {
     act.sa_handler = sig_func; // pointer to function
     sigaction(SIGINT, &act, NULL);
 
-    // creating unix sockets, ipc_local_addr to receive and other two to send data
+    // creating unix socket ,ipc_local_addr to send and receive points features_addr, imu_addr
+
     struct sockaddr_un ipc_local_addr, imu_addr, features_addr;
     memset(&ipc_local_addr, 0, sizeof(struct sockaddr_un));
     ipc_local_addr.sun_family = AF_UNIX;
@@ -138,6 +160,7 @@ int main(int argc, char **argv) {
     memset(&imu_addr, 0, sizeof(struct sockaddr_un));
     imu_addr.sun_family = AF_UNIX;
     strcpy(imu_addr.sun_path, "/tmp/chobits_imu");
+
     memset(&features_addr, 0, sizeof(struct sockaddr_un));
     features_addr.sun_family = AF_UNIX;
     strcpy(features_addr.sun_path, "/tmp/chobits_features");
@@ -152,11 +175,11 @@ int main(int argc, char **argv) {
     auto featureTrackerLeft = pipeline.create<dai::node::FeatureTracker>();
     auto featureTrackerRight = pipeline.create<dai::node::FeatureTracker>();
     auto imu = pipeline.create<dai::node::IMU>();
+    auto depth = pipeline.create<dai::node::StereoDepth>();
 
     auto xoutTrackedFeaturesLeft = pipeline.create<dai::node::XLinkOut>();
     auto xoutTrackedFeaturesRight = pipeline.create<dai::node::XLinkOut>();
     auto xinTrackedFeaturesConfig = pipeline.create<dai::node::XLinkIn>();
-    auto depth = pipeline.create<dai::node::StereoDepth>();
     auto xout_disp = pipeline.create<dai::node::XLinkOut>();
     auto xout_imu = pipeline.create<dai::node::XLinkOut>();
     // auto xout_focal = pipeline.create<dai::node::XLinkOut>(); //here
@@ -177,15 +200,13 @@ int main(int argc, char **argv) {
     monoRight->setCamera("right");
     monoRight->setFps(FPS);
 
-    featureTrackerLeft->initialConfig.setNumTargetFeatures(16*5);
-    featureTrackerRight->initialConfig.setNumTargetFeatures(16*5);
+    featureTrackerLeft->initialConfig.setNumTargetFeatures(TARGET_FEATURES);
+    featureTrackerRight->initialConfig.setNumTargetFeatures(TARGET_FEATURES);
     // Initialize motion estimator to hardware-accelerated mode (can be changed at runtime via trackedFeaturesConfig)
-    {
-        auto ftCfg = featureTrackerLeft->initialConfig.get();
-        ftCfg.motionEstimator.type = dai::FeatureTrackerConfig::MotionEstimator::Type::HW_MOTION_ESTIMATION;
-        featureTrackerLeft->initialConfig.set(ftCfg);
-        featureTrackerRight->initialConfig.set(ftCfg);
-    }
+    auto ftCfg = featureTrackerLeft->initialConfig.get();
+    ftCfg.motionEstimator.type = dai::FeatureTrackerConfig::MotionEstimator::Type::HW_MOTION_ESTIMATION;
+    featureTrackerLeft->initialConfig.set(ftCfg);
+    featureTrackerRight->initialConfig.set(ftCfg);
     /*dai::RawFeatureTrackerConfig config = featureTrackerLeft->initialConfig.get();
     config.cornerDetector.numMaxFeatures = 100;
     featureTrackerLeft->initialConfig.set(config);
@@ -202,7 +223,7 @@ int main(int argc, char **argv) {
     depth->setLeftRightCheck(true);
     depth->setExtendedDisparity(false);
     depth->setSubpixel(true);
-    depth->setSubpixelFractionalBits(3); 
+    depth->setSubpixelFractionalBits(FRAC_BITS_N); 
     depth->setDepthAlign(dai::RawStereoDepthConfig::AlgorithmControl::DepthAlign::RECTIFIED_LEFT);
     depth->setAlphaScaling(0);
 
@@ -257,7 +278,7 @@ int main(int argc, char **argv) {
     std::cout << "Usb speed: " << device.getUsbSpeed() << "\n";
     std::cout << "Device name: " << device.getDeviceName() << " Product name: " << device.getProductName() << "\n";
 
-    dai::CalibrationHandler calibData = device.readCalibration2();
+    dai::CalibrationHandler calibData = device.readCalibration2(); // read current calibration data
     double f, cx, cy;
     float baseline = calibData.getBaselineDistance(dai::CameraBoardSocket::CAM_B, dai::CameraBoardSocket::CAM_C, false) * 0.01f;
     calc_rect_cam_intri_extri(calibData, &f, &cx, &cy);
@@ -489,7 +510,7 @@ int main(int argc, char **argv) {
                             buf_ptr[11] = vx;
                             buf_ptr[12] = vy;
 
-                            if (c < 118) {
+                            if (c < MAXIMUM_FEATURES) {
                                 ++c;
                                 buf_ptr += 13;
                             }
@@ -499,10 +520,10 @@ int main(int argc, char **argv) {
                     }
                 }
             }
-            // logging every ccc=60 frames
-            ccc++;
-            if (ccc > 60) {
-                ccc = 0;
+            // logging every 60 frames
+            num_frames++;
+            if (num_frames > 60) {
+                num_frames = 0;
                 std::cout << c << " features\n";
                 std::cout << "average latency LEFT: " << l_sum/l_count << " ms\n";
                 std::cout << "average latency RIGHT: " << r_sum/r_count << " ms\n";
@@ -514,7 +535,7 @@ int main(int argc, char **argv) {
                 r_count = 0;
                 disp_count = 0;
             }
-            if (c < 10) std::cout << "WARNING: too few features: " << c << "\n";
+            if (c < MIN_FEATURES) std::cout << "WARNING: too few features: " << c << "\n";
             // sending features
             if (imu_ok && c > 0) {
                 big_buf[0] = c;
