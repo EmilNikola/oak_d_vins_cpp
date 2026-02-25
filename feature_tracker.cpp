@@ -63,12 +63,15 @@ latency with LR and subpixel according to documentation: 800P: 30.5ms 400P: 10.1
 //     }
 // };
 
-double big_buf[NUMBEROF_DATA*MAXIMUM_FEATURES];
-
-bool camera_run = true;
+volatile sig_atomic_t camera_run = 1;
 void sig_func(int sig) {
-    camera_run = false;
+    camera_run = 0;
 }
+
+// line color
+static const auto lineColor = cv::Scalar(200, 0, 200);
+// point color
+static const auto pointColor = cv::Scalar(0, 0, 255);
 
 void calc_rect_cam_intri_extri(dai::CalibrationHandler calibData, double* f, double* cx, double* cy) {
     
@@ -236,16 +239,16 @@ int main(int argc, char **argv) {
     // creating unix socket ,ipc_local_addr to send and receive points features_addr, imu_addr
 
     struct sockaddr_un ipc_local_addr, imu_addr, features_addr;
+    unlink("/tmp/chobits_2222");
     memset(&ipc_local_addr, 0, sizeof(struct sockaddr_un));
     ipc_local_addr.sun_family = AF_UNIX;
     strcpy(ipc_local_addr.sun_path, "/tmp/chobits_2222");
     int ipc_sock = socket(AF_UNIX, SOCK_DGRAM, 0);
-    if (ipc_sock < 0) {
+    if (ipc_sock == -1) {
         perror("ipc_sock creation failed");
         exit(EXIT_FAILURE);
     }
-    unlink("/tmp/chobits_2222");
-    if (bind(ipc_sock, (struct sockaddr*)&ipc_local_addr, sizeof(ipc_local_addr)) < 0) {
+    if (bind(ipc_sock, (struct sockaddr*)&ipc_local_addr, sizeof(ipc_local_addr)) == -1) {
         perror("bind failed");
         exit(EXIT_FAILURE);
     }
@@ -471,14 +474,21 @@ int main(int argc, char **argv) {
         // Handle passthrough frames (display) - these are emitted by FeatureTracker passthroughInputImage
         if (q_name == "passthroughFrameLeft") {
             auto inPassthroughFrameLeft = passthroughImageLeftQueue->get<dai::ImgFrame>();
-            cv::Mat passthroughFrameLeft = inPassthroughFrameLeft->getFrame();
+            // DepthAI may be built without OpenCV helper support; get raw data and construct a cv::Mat
+            auto dataLeft = inPassthroughFrameLeft->getData();
+            int hLeft = inPassthroughFrameLeft->getHeight();
+            int wLeft = inPassthroughFrameLeft->getWidth();
+            cv::Mat passthroughFrameLeft(hLeft, wLeft, CV_8UC1, (void*)dataLeft.data());
             cv::cvtColor(passthroughFrameLeft, leftFrame, cv::COLOR_GRAY2BGR);
             // draw and show
             leftFeatureDrawer.drawFeatures(leftFrame);
             cv::imshow(leftWindowName, leftFrame);
         } else if (q_name == "passthroughFrameRight") {
             auto inPassthroughFrameRight = passthroughImageRightQueue->get<dai::ImgFrame>();
-            cv::Mat passthroughFrameRight = inPassthroughFrameRight->getFrame();
+            auto dataRight = inPassthroughFrameRight->getData();
+            int hRight = inPassthroughFrameRight->getHeight();
+            int wRight = inPassthroughFrameRight->getWidth();
+            cv::Mat passthroughFrameRight(hRight, wRight, CV_8UC1, (void*)dataRight.data());
             cv::cvtColor(passthroughFrameRight, rightFrame, cv::COLOR_GRAY2BGR);
             rightFeatureDrawer.drawFeatures(rightFrame);
             cv::imshow(rightWindowName, rightFrame);
@@ -539,20 +549,26 @@ int main(int argc, char **argv) {
         } else if (q_name == "imu") {
             auto imuData = imuQueue->get<dai::IMUData>();
             auto imuPackets = imuData->packets;
-            for(const auto& imuPacket : imuPackets) {
-                auto& acc = imuPacket.acceleroMeter;
-                auto& gyro = imuPacket.gyroscope;
-                //std::cout << "imu latency, acc:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - acc.getTimestamp()).count() << " ms, gyro:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - gyro.getTimestamp()).count() << " ms\n";
-                big_buf[0] = std::chrono::duration<double>(gyro.getTimestampDevice().time_since_epoch()).count();
-                // translate to ros frame, easier to understand in rviz
-                big_buf[1] = -acc.z;
-                big_buf[2] = -acc.y;
-                big_buf[3] = -acc.x;
-                big_buf[4] = -gyro.z;
-                big_buf[5] = -gyro.y;
-                big_buf[6] = -gyro.x;
-                sendto(ipc_sock, big_buf, 7*sizeof(double), 0, (struct sockaddr*)&imu_addr, sizeof(struct sockaddr_un));
-            }
+                    for(const auto& imuPacket : imuPackets) {
+                        auto& acc = imuPacket.acceleroMeter;
+                        auto& gyro = imuPacket.gyroscope;
+                        // prepare local buffer for IMU message
+                        double imu_buf[7];
+                        imu_buf[0] = std::chrono::duration<double>(gyro.getTimestampDevice().time_since_epoch()).count();
+                        // translate to ros frame
+                        imu_buf[1] = -acc.z;
+                        imu_buf[2] = -acc.y;
+                        imu_buf[3] = -acc.x;
+                        imu_buf[4] = -gyro.z;
+                        imu_buf[5] = -gyro.y;
+                        imu_buf[6] = -gyro.x;
+                        ssize_t sent = sendto(ipc_sock, imu_buf, sizeof(imu_buf), 0, (struct sockaddr*)&imu_addr, sizeof(struct sockaddr_un));
+                        if (sent == -1) {
+                            perror("imu data send failed");
+                            camera_run = 0;
+                            break;
+                        }
+                    }
             // if (!imu_ok) {
             //     imu_ok = true;
             //     std::cout << "imu ok\n";
@@ -566,8 +582,10 @@ int main(int argc, char **argv) {
             disp_seq = -3;
             std::unordered_map<int , dai::Point2f> features;
             int c = 0;
-            big_buf[1] = std::chrono::duration<double>(features_tp.time_since_epoch()).count(); // duration between epoch and timestamp of frame expressed in seconds
-            double* buf_ptr = big_buf + 2; // first two slots are occupied with timestamps
+            // prepare a local buffer: [count, timestamp, feature blocks...]
+            std::vector<double> features_msg(2 + NUMBEROF_DATA * MAXIMUM_FEATURES);
+            features_msg[1] = std::chrono::duration<double>(features_tp.time_since_epoch()).count(); // duration between epoch and timestamp of frame expressed in seconds
+            size_t buf_index = 2; // first two slots are occupied with timestamps
             for (const auto &l_feature : l_features) {
                 float x = l_feature.position.x;
                 float y = l_feature.position.y;
@@ -585,13 +603,13 @@ int main(int argc, char **argv) {
                             vx = (cur_un_x - prv_pos->second.x) / dt;
                             vy = (cur_un_y - prv_pos->second.y) / dt;
                         }
-                        buf_ptr[0] = l_feature.id; // store id
-                        buf_ptr[1] = cur_un_x; // store normalised position x
-                        buf_ptr[2] = cur_un_y; // and y
-                        buf_ptr[3] = x; // store position x
-                        buf_ptr[4] = y; // and y
-                        buf_ptr[5] = vx; // store x 
-                        buf_ptr[6] = vy; // and y speed
+                        features_msg[buf_index + 0] = static_cast<double>(l_feature.id); // store id
+                        features_msg[buf_index + 1] = cur_un_x; // store normalised position x
+                        features_msg[buf_index + 2] = cur_un_y; // and y
+                        features_msg[buf_index + 3] = x; // store position x
+                        features_msg[buf_index + 4] = y; // and y
+                        features_msg[buf_index + 5] = vx; // store x 
+                        features_msg[buf_index + 6] = vy; // and y speed
                         // storing right feature positions instead of left
                         x = r_feature->second.x;
                         y = r_feature->second.y;
@@ -604,16 +622,16 @@ int main(int argc, char **argv) {
                             vx = (cur_un_x - prv_pos->second.x) / dt;
                             vy = (cur_un_y - prv_pos->second.y) / dt;
                         }
-                        buf_ptr[7] = cur_un_x;
-                        buf_ptr[8] = cur_un_y;
-                        buf_ptr[9] = x;
-                        buf_ptr[10] = y;
-                        buf_ptr[11] = vx;
-                        buf_ptr[12] = vy;
+                        features_msg[buf_index + 7] = cur_un_x;
+                        features_msg[buf_index + 8] = cur_un_y;
+                        features_msg[buf_index + 9] = x;
+                        features_msg[buf_index + 10] = y;
+                        features_msg[buf_index + 11] = vx;
+                        features_msg[buf_index + 12] = vy;
 
                         if (c < MAXIMUM_FEATURES) { // maximum number of features
                             ++c;
-                            buf_ptr += NUMBEROF_DATA; // move to next position in buffer accordingly
+                            buf_index += NUMBEROF_DATA; // move to next position in buffer accordingly
                         }
 
                         continue;
@@ -640,13 +658,13 @@ int main(int argc, char **argv) {
                                 vx = (cur_un_x - prv_pos->second.x) / dt;
                                 vy = (cur_un_y - prv_pos->second.y) / dt;
                             }
-                            buf_ptr[0] = l_feature.id;
-                            buf_ptr[1] = cur_un_x;
-                            buf_ptr[2] = cur_un_y;
-                            buf_ptr[3] = x;
-                            buf_ptr[4] = y;
-                            buf_ptr[5] = vx;
-                            buf_ptr[6] = vy;
+                            features_msg[buf_index + 0] = static_cast<double>(l_feature.id);
+                            features_msg[buf_index + 1] = cur_un_x;
+                            features_msg[buf_index + 2] = cur_un_y;
+                            features_msg[buf_index + 3] = x;
+                            features_msg[buf_index + 4] = y;
+                            features_msg[buf_index + 5] = vx;
+                            features_msg[buf_index + 6] = vy;
 
                             x = r_feature.position.x;
                             y = r_feature.position.y;
@@ -659,16 +677,16 @@ int main(int argc, char **argv) {
                                 vx = (cur_un_x - prv_pos->second.x) / dt;
                                 vy = (cur_un_y - prv_pos->second.y) / dt;
                             }
-                            buf_ptr[7] = cur_un_x;
-                            buf_ptr[8] = cur_un_y;
-                            buf_ptr[9] = x;
-                            buf_ptr[10] = y;
-                            buf_ptr[11] = vx;
-                            buf_ptr[12] = vy;
+                            features_msg[buf_index + 7] = cur_un_x;
+                            features_msg[buf_index + 8] = cur_un_y;
+                            features_msg[buf_index + 9] = x;
+                            features_msg[buf_index + 10] = y;
+                            features_msg[buf_index + 11] = vx;
+                            features_msg[buf_index + 12] = vy;
 
                             if (c < MAXIMUM_FEATURES) {
                                 ++c;
-                                buf_ptr += NUMBEROF_DATA;
+                                buf_index += NUMBEROF_DATA;
                             }
 
                             break;
@@ -695,8 +713,12 @@ int main(int argc, char **argv) {
             // sending features
             if (c > 0) {
             //if (imu_ok && c > 0) {
-                big_buf[0] = c;
-                sendto(ipc_sock, big_buf, NUMBEROF_DATA*sizeof(double)*c+2*sizeof(double), 0, (struct sockaddr*)&features_addr, sizeof(struct sockaddr_un));
+                features_msg[0] = static_cast<double>(c);
+                ssize_t sent = sendto(ipc_sock, features_msg.data(), static_cast<size_t>(2 + NUMBEROF_DATA * c) * sizeof(double), 0, (struct sockaddr*)&features_addr, sizeof(struct sockaddr_un));
+                if (sent == -1) {
+                    perror("features data send failed");
+                    camera_run = 0;
+                }
             }
 
             // current frame moved to previous to make place for new frame
