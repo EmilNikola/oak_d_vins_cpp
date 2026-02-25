@@ -1,23 +1,15 @@
 /*
-FPS(kamera, gyroskop a akcelerometr)xPERFORMANCE(filtry, NO of features, disparity)
-
-CONFIG: initialConfig logging, parametry - tracker type, treshol (a moznost runtime zmeny)
-CONFIG: jak se pristupuje ke zpracovani dat z IMU
-CONFIG: report rate na senzorech porovnat s datasheetovymi specifikacemi, take rate jak jsou data odesilana nejak probrat
-CONFIG: ktera z tech mereni latenci ukazuje to co chci?
 CONFIG: openCV okenko
 CONFIG: passthrough framy pro debug
 CONFIG: safe indices; cast row/col to int — keepconsistent across for new pixel reads to avoid UB with uint16_t* indexing.
-CONFIG: jestli se CV rectification projevi jako zbytecna, bude odstranena pro rychlejsi loop
 
-upravit sirku toho bufferu aby davala smysl
-odstranit imu_ok? asi k nicemu
-zkusit stream misto dgram?
-current depth a initialConfig nastavovani duplicita
+NUTNOST KAMERY:
 je float baseline redundantni?
-
-
-kodek vicisteny po while loop!!!!!!!!
+imu_ok zakomentovano uvidime co to udela
+CONFIG: jestli se CV rectification projevi jako zbytecna, bude odstranena pro rychlejsi loop - nahrazeni setRectification(True)
+CONFIG: ktera z tech mereni latenci ukazuje to co chci?
+pocet features se zda byt velmi maly podle .hpp source
+rychlosti akcelerometru a gyroskopu
 
 
 COLOR CAMERA:   IMX378  4056x3040   85@2024x1520
@@ -37,6 +29,7 @@ latency with LR and subpixel according to documentation: 800P: 30.5ms 400P: 10.1
 #include <sys/socket.h> // communication endpoints
 #include <unistd.h> // posix api
 #include <string.h>
+#include <string>
 #include <sys/un.h> // unix sockets
 #include <signal.h> // signal handling
 
@@ -57,6 +50,7 @@ latency with LR and subpixel according to documentation: 800P: 30.5ms 400P: 10.1
 #define MAXIMUM_FEATURES 118
 #define FPS 20
 #define FRAC_BITS_N 3
+#define NUMBEROF_DATA 13
 
 // 2D point location values
 // struct MyPoint2d {
@@ -69,7 +63,7 @@ latency with LR and subpixel according to documentation: 800P: 30.5ms 400P: 10.1
 //     }
 // };
 
-double big_buf[12*1024/sizeof(double)]; // buffer size is just "big enough"
+double big_buf[NUMBEROF_DATA*MAXIMUM_FEATURES];
 
 bool camera_run = true;
 void sig_func(int sig) {
@@ -131,8 +125,18 @@ void calc_rect_cam_intri_extri(dai::CalibrationHandler calibData, double* f, dou
     *cy = p1.at<double>(1, 2);
 }
 
+void printConfig(const char *time, dai::RawFeatureTrackerConfig cfg) {
+    std::cout << "Config " << time << " modification:\n";
+    std::cout << "numTargetFeatures " << cfg.cornerDetector.numTargetFeatures << "\n";
+    std::cout << "numMaxFeatures " << cfg.cornerDetector.numMaxFeatures << "\n";
+    std::cout << "cornerDetectorType " << static_cast<int>(cfg.cornerDetector.type) << "\n";
+    std::cout << "maintainTresholdsDistance " << cfg.featureMaintainer.minimumDistanceBetweenFeatures << "\n";
+    std::cout << "maintainTresholdsTostFeature " << cfg.featureMaintainer.lostFeatureErrorThreshold << "\n";
+    std::cout << "maintainTresholdsTrackedFeature " << cfg.featureMaintainer.trackedFeatureThreshold << "\n";
+}
+
 int main(int argc, char **argv) {
-    bool imu_ok = false;
+    //bool imu_ok = false;
     int num_frames=0; // number of frames
 
     // terminate process by calling SIGINT(Ctrl-C)
@@ -200,23 +204,37 @@ int main(int argc, char **argv) {
     monoRight->setCamera("right");
     monoRight->setFps(FPS);
 
-    featureTrackerLeft->initialConfig.setNumTargetFeatures(TARGET_FEATURES);
-    featureTrackerRight->initialConfig.setNumTargetFeatures(TARGET_FEATURES);
-    // Initialize motion estimator to hardware-accelerated mode (can be changed at runtime via trackedFeaturesConfig)
-    auto ftCfg = featureTrackerLeft->initialConfig.get();
-    ftCfg.motionEstimator.type = dai::FeatureTrackerConfig::MotionEstimator::Type::HW_MOTION_ESTIMATION;
-    featureTrackerLeft->initialConfig.set(ftCfg);
-    featureTrackerRight->initialConfig.set(ftCfg);
-    /*dai::RawFeatureTrackerConfig config = featureTrackerLeft->initialConfig.get();
-    config.cornerDetector.numMaxFeatures = 100;
-    featureTrackerLeft->initialConfig.set(config);
-    config = featureTrackerRight->initialConfig.get();
-    config.cornerDetector.numMaxFeatures = 100;
-    featureTrackerRight->initialConfig.set(config);*/
-    
+
+    // Initializes motion estimator to LucasKanade
+    auto featureTrackerConfig = featureTrackerLeft->initialConfig.get();
+    printConfig("before", featureTrackerConfig);
+
+    featureTrackerConfig.cornerDetector.numTargetFeatures = TARGET_FEATURES;
+    featureTrackerConfig.cornerDetector.numMaxFeatures = MAXIMUM_FEATURES;
+
+    /*
+    featureTrackerConfig.cornerDetector.type = dai::FeatureTrackerConfig::CornerDetector::Type::SHI_THOMASI;
+    featureTrackerConfig.motionEstimator.type = dai::FeatureTrackerConfig::MotionEstimator::Type::HW_MOTION_ESTIMATION;
+    // LukasKanade empirical config /inlcude/depthai/pipeline/datatype/FeatureTrackerConfig.hpp
+    featureTrackerConfig.opticalFlow.searchWindowWidth = 5;
+    featureTrackerConfig.opticalFlow.searchWindowHeight = 5;
+    featureTrackerConfig.opticalFlow.epsilon = 0.01f;
+    featureTrackerConfig.opticalFlow.maxIterations = 9;
+    //featureMaintainer likely to remain unchanged
+    featureTrackerConfig.FeatureMaintainer.minimumDistanceBetweenFeatures = 50;
+    featureTrackerConfig.FeatureMaintainer.lostFeatureErrorThreshold = 50000;
+    featureTrackerConfig.FeatureMaintainer.trackedFeatureThreshold = 200000;
+    */
+
+    featureTrackerLeft->initialConfig.set(featureTrackerConfig);
+    featureTrackerRight->initialConfig.set(featureTrackerConfig);
+    printConfig("after", featureTrackerConfig);
+
     // according to API refrence for both Shaves and Memory slices, maximum number is allocated
-    featureTrackerLeft->setHardwareResources(2, 2);
-    featureTrackerRight->setHardwareResources(2, 2);
+    auto numShaves = 2;
+    auto numSlices = 2;
+    featureTrackerLeft->setHardwareResources(numShaves, numSlices);
+    featureTrackerRight->setHardwareResources(numShaves, numSlices);
 
     depth->setDefaultProfilePreset(dai::node::StereoDepth::PresetMode::HIGH_ACCURACY);
     depth->initialConfig.setMedianFilter(dai::MedianFilter::KERNEL_5x5);
@@ -226,18 +244,24 @@ int main(int argc, char **argv) {
     depth->setSubpixelFractionalBits(FRAC_BITS_N); 
     depth->setDepthAlign(dai::RawStereoDepthConfig::AlgorithmControl::DepthAlign::RECTIFIED_LEFT);
     depth->setAlphaScaling(0);
+    /*
+    depth->setRectification(true);
+    possibly beneficial but potentional issues
+    - disparity indexing still works?
+    - normalized math works?
+    */
 
-    // enable ACCELEROMETER_RAW at 500 hz rate
+    // Accelerometer options: 15Hz, 31Hz, 62Hz, 125Hz, 250Hz 500Hz
     imu->enableIMUSensor(dai::IMUSensor::ACCELEROMETER, 125);
-    // enable GYROSCOPE_RAW at 400 hz rate
+        // Gyroscope options: 25Hz, 33Hz, 50Hz, 100Hz, 200Hz, 400Hz; 100 might be the max for this option
     imu->enableIMUSensor(dai::IMUSensor::GYROSCOPE_CALIBRATED, 100);
     // it's recommended to set both setBatchReportThreshold and setMaxBatchReports to 20 when integrating in a pipeline with a lot of input/output connections
-    // above this threshold packets will be sent in batch of X, if the host is not blocked and USB bandwidth is available
     imu->setBatchReportThreshold(1);
     // maximum number of IMU packets in a batch, if it's reached device will block sending until host can receive it
     // if lower or equal to batchReportThreshold then the sending is always blocking on device
-    // useful to reduce device's CPU load  and number of lost packets, if CPU load is high on device side due to multiple nodes
+    // useful to reduce device's CPU load and number of lost packets, if CPU load is high on device side due to multiple nodes
     imu->setMaxBatchReports(10);
+    // imu->enableFirmwareUpdate(true) //if i want to update
 
     // Linking
     monoLeft->out.link(depth->left);
@@ -397,10 +421,10 @@ int main(int argc, char **argv) {
                 big_buf[6] = -gyro.x;
                 sendto(ipc_sock, big_buf, 7*sizeof(double), 0, (struct sockaddr*)&imu_addr, sizeof(struct sockaddr_un));
             }
-            if (!imu_ok) {
-                imu_ok = true;
-                std::cout << "imu ok\n";
-            }
+            // if (!imu_ok) {
+            //     imu_ok = true;
+            //     std::cout << "imu ok\n";
+            // }
         }
 
         if (l_seq == r_seq && r_seq == disp_seq) { // executes if left, right and disparity frames align
@@ -457,7 +481,7 @@ int main(int argc, char **argv) {
 
                         if (c < MAXIMUM_FEATURES) { // maximum number of features
                             ++c;
-                            buf_ptr += 13; // move to next position in buffer accordingly
+                            buf_ptr += NUMBEROF_DATA; // move to next position in buffer accordingly
                         }
 
                         continue;
@@ -512,7 +536,7 @@ int main(int argc, char **argv) {
 
                             if (c < MAXIMUM_FEATURES) {
                                 ++c;
-                                buf_ptr += 13;
+                                buf_ptr += NUMBEROF_DATA;
                             }
 
                             break;
@@ -537,9 +561,10 @@ int main(int argc, char **argv) {
             }
             if (c < MIN_FEATURES) std::cout << "WARNING: too few features: " << c << "\n";
             // sending features
-            if (imu_ok && c > 0) {
+            if (c > 0) {
+            //if (imu_ok && c > 0) {
                 big_buf[0] = c;
-                sendto(ipc_sock, big_buf, 13*sizeof(double)*c+2*sizeof(double), 0, (struct sockaddr*)&features_addr, sizeof(struct sockaddr_un));
+                sendto(ipc_sock, big_buf, NUMBEROF_DATA*sizeof(double)*c+2*sizeof(double), 0, (struct sockaddr*)&features_addr, sizeof(struct sockaddr_un));
             }
 
             // current frame moved to previous to make place for new frame
