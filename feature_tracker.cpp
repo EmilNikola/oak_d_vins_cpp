@@ -1,8 +1,4 @@
 /*
-CONFIG: openCV okenko
-CONFIG: passthrough framy pro debug
-CONFIG: safe indices; cast row/col to int — keepconsistent across for new pixel reads to avoid UB with uint16_t* indexing.
-
 NUTNOST KAMERY:
 je float baseline redundantni?
 imu_ok zakomentovano uvidime co to udela
@@ -10,6 +6,7 @@ CONFIG: jestli se CV rectification projevi jako zbytecna, bude odstranena pro ry
 CONFIG: ktera z tech mereni latenci ukazuje to co chci?
 pocet features se zda byt velmi maly podle .hpp source
 rychlosti akcelerometru a gyroskopu
+trosku jinak rozhazene cv okno, treba overit v realu
 
 
 COLOR CAMERA:   IMX378  4056x3040   85@2024x1520
@@ -35,6 +32,9 @@ latency with LR and subpixel according to documentation: 800P: 30.5ms 400P: 10.1
 
 // computer vision
 #include <opencv2/calib3d.hpp>
+// GUI / drawing
+#include <opencv2/highgui.hpp>
+#include <opencv2/imgproc.hpp>
 
 // Includes common necessary includes for development using depthai library
 #include "depthai/depthai.hpp"
@@ -135,6 +135,94 @@ void printConfig(const char *time, dai::RawFeatureTrackerConfig cfg) {
     std::cout << "maintainTresholdsTrackedFeature " << cfg.featureMaintainer.trackedFeatureThreshold << "\n";
 }
 
+class FeatureTrackerDrawer {
+   private:
+    // point size in pixels
+    static const int circleRadius = 2;
+    // longest a path can get in pixels
+    static const int maxTrackedFeaturesPathLength = 30;
+    // for how many frames the feature is tracked   !!
+    static int trackedFeaturesPathLength;
+
+    // alias for id=uint32_t
+    using featureIdType = decltype(dai::TrackedFeature::id);
+
+    // container of types featureIdType as hash-based set - search, insertion and removal have constant-time complexity
+    std::unordered_set<featureIdType> trackedIDs;
+    // container of featureIdType matched to 2D coordinates stored in double opened queue container - deque
+    std::unordered_map<featureIdType, std::deque<dai::Point2f>> trackedFeaturesPath;
+    // unimportant
+    std::string trackbarName;
+    std::string windowName;
+
+   public:
+    // function that takes vector of newly tracked features, and stores them
+    void trackFeaturePath(std::vector<dai::TrackedFeature>& features) {
+        std::unordered_set<featureIdType> newTrackedIDs;
+        for(auto& currentFeature : features) {
+            auto currentID = currentFeature.id;
+            newTrackedIDs.insert(currentID);
+
+            // if trackedFeaturesPath doesnt contain feature with currentID key, empty deque is inserted 
+            //auto& path = trackedFeatures[currentID]; // can replace next 3 lines because of unordered set intrinsic duplicate prevention
+            if(!trackedFeaturesPath.count(currentID)) {
+                trackedFeaturesPath.insert({currentID, std::deque<dai::Point2f>()});
+            }
+            // takes a reference to either last feature or newly created empty deque - value at currentID
+            std::deque<dai::Point2f>& path = trackedFeaturesPath.at(currentID);
+
+            // adds x,y position to path at the end, if vector isnt big enough its automatically resized 
+            path.push_back(currentFeature.position);
+            // if size of path is greater than either one or amount set by trackedFeaturesPathLength, first element is removed
+            while(path.size() > std::max<unsigned int>(1, trackedFeaturesPathLength)) {
+                path.pop_front();
+            }
+        }
+        
+        // .count counts number of elements of that id, which can be either 1 or 0
+        // if newTrrackedIDs doesnt contain ID of a feature in already tracked set,
+        // it is then placed in featuresToRemove set - because it becomes useless
+        std::unordered_set<featureIdType> featuresToRemove;
+        for(auto& oldId : trackedIDs) {
+            if(!newTrackedIDs.count(oldId)) {
+                featuresToRemove.insert(oldId);
+            }
+        }
+        // those features are then removed from trackedFeaturesPath
+        for(auto& id : featuresToRemove) {
+            trackedFeaturesPath.erase(id);
+        }
+        // currently processed features are moved back for the next iteration
+        trackedIDs = newTrackedIDs;
+    }
+
+    // drawer skipped, requires to be sorted through for potentionally important info
+    void drawFeatures(cv::Mat& img) {
+        cv::setTrackbarPos(trackbarName.c_str(), windowName.c_str(), trackedFeaturesPathLength);
+
+        for(auto& featurePath : trackedFeaturesPath) {
+            std::deque<dai::Point2f>& path = featurePath.second;
+            unsigned int j = 0;
+            for(j = 0; j < path.size() - 1; j++) {
+                auto src = cv::Point(path[j].x, path[j].y);
+                auto dst = cv::Point(path[j + 1].x, path[j + 1].y);
+                cv::line(img, src, dst, lineColor, 1, cv::LINE_AA, 0);
+            }
+
+            cv::circle(img, cv::Point(path[j].x, path[j].y), circleRadius, pointColor, -1, cv::LINE_AA, 0);
+        }
+    }
+
+    // class constructor -- describe
+    FeatureTrackerDrawer(std::string trackbarName, std::string windowName) : trackbarName(trackbarName), windowName(windowName) {
+        cv::namedWindow(windowName.c_str());
+        cv::createTrackbar(trackbarName.c_str(), windowName.c_str(), &trackedFeaturesPathLength, maxTrackedFeaturesPathLength, nullptr);
+    }
+};
+
+// sets the amount of frames a feature is tracked across to 10
+int FeatureTrackerDrawer::trackedFeaturesPathLength = 10;
+
 int main(int argc, char **argv) {
     //bool imu_ok = false;
     int num_frames=0; // number of frames
@@ -183,6 +271,8 @@ int main(int argc, char **argv) {
 
     auto xoutTrackedFeaturesLeft = pipeline.create<dai::node::XLinkOut>();
     auto xoutTrackedFeaturesRight = pipeline.create<dai::node::XLinkOut>();
+    auto xoutPassthroughFrameLeft = pipeline.create<dai::node::XLinkOut>();
+    auto xoutPassthroughFrameRight = pipeline.create<dai::node::XLinkOut>();
     auto xinTrackedFeaturesConfig = pipeline.create<dai::node::XLinkIn>();
     auto xout_disp = pipeline.create<dai::node::XLinkOut>();
     auto xout_imu = pipeline.create<dai::node::XLinkOut>();
@@ -191,6 +281,8 @@ int main(int argc, char **argv) {
     // specify some stream names over which nodes receive their data
     xoutTrackedFeaturesLeft->setStreamName("trackedFeaturesLeft");
     xoutTrackedFeaturesRight->setStreamName("trackedFeaturesRight");
+    xoutPassthroughFrameLeft->setStreamName("passthroughFrameLeft");
+    xoutPassthroughFrameRight->setStreamName("passthroughFrameRight");
     xinTrackedFeaturesConfig->setStreamName("trackedFeaturesConfig");
     xout_disp->setStreamName("disparity");
     xout_imu->setStreamName("imu");
@@ -266,10 +358,12 @@ int main(int argc, char **argv) {
     // Linking
     monoLeft->out.link(depth->left);
     depth->rectifiedLeft.link(featureTrackerLeft->inputImage);
+    featureTrackerLeft->passthroughInputImage.link(xoutPassthroughFrameLeft->input);
     featureTrackerLeft->outputFeatures.link(xoutTrackedFeaturesLeft->input);
 
     monoRight->out.link(depth->right);
     depth->rectifiedRight.link(featureTrackerRight->inputImage);
+    featureTrackerRight->passthroughInputImage.link(xoutPassthroughFrameRight->input);
     featureTrackerRight->outputFeatures.link(xoutTrackedFeaturesRight->input);
 
     depth->disparity.link(xout_disp->input);
@@ -333,10 +427,19 @@ int main(int argc, char **argv) {
     // 3rd argument when false specifies that old messages are overwritten when the queue is full
     auto outputFeaturesLeftQueue = device.getOutputQueue("trackedFeaturesLeft", 4, false); // size of queue, increased slightly to reduce jitter
     auto outputFeaturesRightQueue = device.getOutputQueue("trackedFeaturesRight", 4, false);
+    auto passthroughImageLeftQueue = device.getOutputQueue("passthroughFrameLeft", 4, false);
+    auto passthroughImageRightQueue = device.getOutputQueue("passthroughFrameRight", 4, false);
     auto disp_queue = device.getOutputQueue("disparity", 4, false);
     auto imuQueue = device.getOutputQueue("imu", 5, false);
     // Input queue to send runtime FeatureTracker config updates (optional)
     auto inputFeatureTrackerConfigQueue = device.getInputQueue("trackedFeaturesConfig");
+
+    // Visualization windows / drawers
+    const auto leftWindowName = "left";
+    auto leftFeatureDrawer = FeatureTrackerDrawer("Feature tracking duration (frames)", leftWindowName);
+
+    const auto rightWindowName = "right";
+    auto rightFeatureDrawer = FeatureTrackerDrawer("Feature tracking duration (frames)", rightWindowName);
     // auto focalQueue = device.getOutputQueue("focal", 1, false); //here
 
     // sequence numbers initialisation
@@ -352,6 +455,8 @@ int main(int argc, char **argv) {
     std::unordered_map<int, dai::Point2f> r_cur_features; // right image current features indexed map
     std::chrono::time_point<std::chrono::steady_clock, std::chrono::steady_clock::duration> features_tp, prv_features_tp; // timestamps of frames
     std::unordered_map<int, int> lr_id_mapping; // features detected in left image paired to features in right
+    // Mats for visualization
+    cv::Mat leftFrame, rightFrame;
 
     // Clear queue events
     //jakaskerl suggest remove this line
@@ -363,12 +468,33 @@ int main(int argc, char **argv) {
 
     while(camera_run) {
         auto q_name = device.getQueueEvent();
+        // Handle passthrough frames (display) - these are emitted by FeatureTracker passthroughInputImage
+        if (q_name == "passthroughFrameLeft") {
+            auto inPassthroughFrameLeft = passthroughImageLeftQueue->get<dai::ImgFrame>();
+            cv::Mat passthroughFrameLeft = inPassthroughFrameLeft->getFrame();
+            cv::cvtColor(passthroughFrameLeft, leftFrame, cv::COLOR_GRAY2BGR);
+            // draw and show
+            leftFeatureDrawer.drawFeatures(leftFrame);
+            cv::imshow(leftWindowName, leftFrame);
+        } else if (q_name == "passthroughFrameRight") {
+            auto inPassthroughFrameRight = passthroughImageRightQueue->get<dai::ImgFrame>();
+            cv::Mat passthroughFrameRight = inPassthroughFrameRight->getFrame();
+            cv::cvtColor(passthroughFrameRight, rightFrame, cv::COLOR_GRAY2BGR);
+            rightFeatureDrawer.drawFeatures(rightFrame);
+            cv::imshow(rightWindowName, rightFrame);
+        }
 
         if (q_name == "trackedFeaturesLeft") { // waits until specified queue gets a message
             auto data = outputFeaturesLeftQueue->get<dai::TrackedFeatures>();
             l_features = data->trackedFeatures;
             l_seq = data->getSequenceNum(); // retrieve sequence number
             features_tp = data->getTimestampDevice(); // timestamp from camera
+            // update tracking paths for visualization
+            leftFeatureDrawer.trackFeaturePath(l_features);
+            if (!leftFrame.empty()) {
+                leftFeatureDrawer.drawFeatures(leftFrame);
+                cv::imshow(leftWindowName, leftFrame);
+            }
             //std::cout << "LEFT ft " << l_seq << " latency:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - features_tp).count() << " ms\n";
             l_sum += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - features_tp).count();
             l_count += 1;
@@ -376,6 +502,12 @@ int main(int argc, char **argv) {
             auto data = outputFeaturesRightQueue->get<dai::TrackedFeatures>();
             r_features = data->trackedFeatures;
             r_seq = data->getSequenceNum();
+            // update tracking paths for visualization
+            rightFeatureDrawer.trackFeaturePath(r_features);
+            if (!rightFrame.empty()) {
+                rightFeatureDrawer.drawFeatures(rightFrame);
+                cv::imshow(rightWindowName, rightFrame);
+            }
             //std::cout << "RIGHT ft " << r_seq << " latency:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - data->getTimestamp()).count() << " ms\n";
             r_sum += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - data->getTimestamp()).count();
             r_count += 1;
