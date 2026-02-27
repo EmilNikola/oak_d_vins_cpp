@@ -17,6 +17,8 @@ latency with LR and subpixel according to documentation: 800P: 30.5ms 400P: 10.1
 #include <chrono>
 #include <vector>
 #include <cstdint>
+#include <cstdlib>
+#include <string>
 
 #include <math.h>
 #include <stdio.h>
@@ -293,28 +295,28 @@ int main(int argc, char **argv) {
     // Properties
     monoLeft->setResolution(dai::MonoCameraProperties::SensorResolution::THE_400_P);
     monoLeft->setCamera("left");
-    monoLeft->setFps(argv[3]);
+    monoLeft->setFps(strtol(argv[3],NULL,10));
     monoRight->setResolution(dai::MonoCameraProperties::SensorResolution::THE_400_P);
     monoRight->setCamera("right");
-    monoRight->setFps(argv[3]);
+    monoRight->setFps(strtol(argv[3],NULL,10));
 
 
     // Initializes motion estimator to LucasKanade
     auto featureTrackerConfig = featureTrackerLeft->initialConfig.get();
     printConfig("before", featureTrackerConfig);
 
-    featureTrackerConfig.cornerDetector.numTargetFeatures = argv[1];
-    featureTrackerConfig.cornerDetector.numMaxFeatures = argv[2];
+    featureTrackerConfig.cornerDetector.numTargetFeatures = strtol(argv[1],NULL,10);
+    featureTrackerConfig.cornerDetector.numMaxFeatures = strtol(argv[2],NULL,10);
 
     //HARRIS OR SHI_THOMASI, I prefer shi_tomasi
     featureTrackerConfig.cornerDetector.type = dai::FeatureTrackerConfig::CornerDetector::Type::SHI_THOMASI;
     // HW_MOTION_ESTIMATION or LUCAS_KANADE_OPTICAL_FLOW, I prefer lucas-kanade, but this might be worth a try
     //featureTrackerConfig.motionEstimator.type = dai::FeatureTrackerConfig::MotionEstimator::Type::HW_MOTION_ESTIMATION;
     // LukasKanade empirical config /inlcude/depthai/pipeline/datatype/FeatureTrackerConfig.hpp
-    featureTrackerConfig.opticalFlow.searchWindowWidth = argv[7];
-    featureTrackerConfig.opticalFlow.searchWindowHeight = argv[7];
-    featureTrackerConfig.opticalFlow.epsilon = argv[8];
-    featureTrackerConfig.opticalFlow.maxIterations = argv[9];
+    featureTrackerConfig.motionEstimator.opticalFlow.searchWindowWidth = strtol(argv[7],NULL,10);
+    featureTrackerConfig.motionEstimator.opticalFlow.searchWindowHeight = strtol(argv[7],NULL,10);
+    featureTrackerConfig.motionEstimator.opticalFlow.epsilon = std::stof(argv[8], NULL);
+    featureTrackerConfig.motionEstimator.opticalFlow.maxIterations = strtol(argv[9],NULL,10);
     //featureMaintainer likely to remain unchanged
     //featureTrackerConfig.FeatureMaintainer.minimumDistanceBetweenFeatures = 50;
     //featureTrackerConfig.FeatureMaintainer.lostFeatureErrorThreshold = 50000;
@@ -336,7 +338,7 @@ int main(int argc, char **argv) {
     depth->setLeftRightCheck(true);
     depth->setExtendedDisparity(false);
     depth->setSubpixel(true);
-    depth->setSubpixelFractionalBits(argv[4]); 
+    depth->setSubpixelFractionalBits(strtol(argv[4],NULL,10)); 
     depth->setDepthAlign(dai::RawStereoDepthConfig::AlgorithmControl::DepthAlign::RECTIFIED_LEFT);
     depth->setAlphaScaling(0);
     /*
@@ -344,12 +346,12 @@ int main(int argc, char **argv) {
     - disparity indexing still works?
     - normalized math works?
     */
-    depth->setRectification(argv[10]);
+    depth->setRectification(strtol(argv[10],NULL,10));
 
     // Accelerometer options: 15Hz, 31Hz, 62Hz, 125Hz, 250Hz 500Hz
-    imu->enableIMUSensor(dai::IMUSensor::ACCELEROMETER, argv[5]);
+    imu->enableIMUSensor(dai::IMUSensor::ACCELEROMETER, strtol(argv[5],NULL,10));
         // Gyroscope options: 25Hz, 33Hz, 50Hz, 100Hz, 200Hz, 400Hz; 100 might be the max for this option
-    imu->enableIMUSensor(dai::IMUSensor::GYROSCOPE_CALIBRATED, argv[6]);
+    imu->enableIMUSensor(dai::IMUSensor::GYROSCOPE_CALIBRATED, strtol(argv[6],NULL,10));
     // it's recommended to set both setBatchReportThreshold and setMaxBatchReports to 20 when integrating in a pipeline with a lot of input/output connections
     imu->setBatchReportThreshold(1);
     // maximum number of IMU packets in a batch, if it's reached device will block sending until host can receive it
