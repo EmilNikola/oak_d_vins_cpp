@@ -3,14 +3,9 @@ odstranit potencialni deleni nulou (rychlosti)
 je pDisp_frame16 safe? k zamysleni
 
 NUTNOST KAMERY:
-je float baseline redundantni?
-imu_ok zakomentovano uvidime co to udela
 CONFIG: jestli se CV rectification projevi jako zbytecna, bude odstranena pro rychlejsi loop - nahrazeni setRectification(True)
-CONFIG: ktera z tech mereni latenci ukazuje to co chci?
-pocet features se zda byt velmi maly podle .hpp source
-rychlosti akcelerometru a gyroskopu
-trosku jinak rozhazene cv okno, treba overit v realu
 
+imu_ok zakomentovano uvidime co to udela
 
 COLOR CAMERA:   IMX378  4056x3040   85@2024x1520
 MONO CAMERA:    OV9282  1280x800    THE_400_P: 255@640x400  THE_720_P: 143@1280x720 THE_800_P 129@1280x800  anti-banding mode*  3a algoritmy*
@@ -49,7 +44,7 @@ latency with LR and subpixel according to documentation: 800P: 30.5ms 400P: 10.1
 #define CAM_H 400
 #define PAIR_DIST_SQ 9 // threshold macro
 #define MIN_FEATURES 10
-#define TARGET_FEATURES 80
+#define TARGET_FEATURES 80 // 320 is the default from source
 #define MAXIMUM_FEATURES 118
 #define FPS 20
 #define FRAC_BITS_N 3
@@ -81,8 +76,9 @@ void calc_rect_cam_intri_extri(dai::CalibrationHandler calibData, double* f, dou
     float data[9]; // left and right intrinsics
 
     // bool uses translation information from board design data
-    std::cout << "stereo baseline:" << calibData.getBaselineDistance(dai::CameraBoardSocket::CAM_B, dai::CameraBoardSocket::CAM_C, false);
-    std::cout << "stereo baseline:" << calibData.getBaselineDistance(dai::CameraBoardSocket::CAM_B, dai::CameraBoardSocket::CAM_C, true) << " cm\n CAMERA TO IMU EXTRINSICS:\n";
+    // stereo baseline:7.50001stereo baseline:7.5 cm
+    //std::cout << "stereo baseline:" << calibData.getBaselineDistance(dai::CameraBoardSocket::CAM_B, dai::CameraBoardSocket::CAM_C, false);
+    //std::cout << "stereo baseline:" << calibData.getBaselineDistance(dai::CameraBoardSocket::CAM_B, dai::CameraBoardSocket::CAM_C, true) << " cm\n CAMERA TO IMU EXTRINSICS:\n";
     
     // to make this available, IMU calibration data would need to be available at the time of calling this function, it seems unimportant at this moment
     /*auto imu_ext = calibData.getCameraToImuExtrinsics(dai::CameraBoardSocket::CAM_B, true);
@@ -297,32 +293,33 @@ int main(int argc, char **argv) {
     // Properties
     monoLeft->setResolution(dai::MonoCameraProperties::SensorResolution::THE_400_P);
     monoLeft->setCamera("left");
-    monoLeft->setFps(FPS);
+    monoLeft->setFps(argv[3]);
     monoRight->setResolution(dai::MonoCameraProperties::SensorResolution::THE_400_P);
     monoRight->setCamera("right");
-    monoRight->setFps(FPS);
+    monoRight->setFps(argv[3]);
 
 
     // Initializes motion estimator to LucasKanade
     auto featureTrackerConfig = featureTrackerLeft->initialConfig.get();
     printConfig("before", featureTrackerConfig);
 
-    featureTrackerConfig.cornerDetector.numTargetFeatures = TARGET_FEATURES;
-    featureTrackerConfig.cornerDetector.numMaxFeatures = MAXIMUM_FEATURES;
+    featureTrackerConfig.cornerDetector.numTargetFeatures = argv[1];
+    featureTrackerConfig.cornerDetector.numMaxFeatures = argv[2];
 
-    /*
+    //HARRIS OR SHI_THOMASI, I prefer shi_tomasi
     featureTrackerConfig.cornerDetector.type = dai::FeatureTrackerConfig::CornerDetector::Type::SHI_THOMASI;
-    featureTrackerConfig.motionEstimator.type = dai::FeatureTrackerConfig::MotionEstimator::Type::HW_MOTION_ESTIMATION;
+    // HW_MOTION_ESTIMATION or LUCAS_KANADE_OPTICAL_FLOW, I prefer lucas-kanade, but this might be worth a try
+    //featureTrackerConfig.motionEstimator.type = dai::FeatureTrackerConfig::MotionEstimator::Type::HW_MOTION_ESTIMATION;
     // LukasKanade empirical config /inlcude/depthai/pipeline/datatype/FeatureTrackerConfig.hpp
-    featureTrackerConfig.opticalFlow.searchWindowWidth = 5;
-    featureTrackerConfig.opticalFlow.searchWindowHeight = 5;
-    featureTrackerConfig.opticalFlow.epsilon = 0.01f;
-    featureTrackerConfig.opticalFlow.maxIterations = 9;
+    featureTrackerConfig.opticalFlow.searchWindowWidth = argv[7];
+    featureTrackerConfig.opticalFlow.searchWindowHeight = argv[7];
+    featureTrackerConfig.opticalFlow.epsilon = argv[8];
+    featureTrackerConfig.opticalFlow.maxIterations = argv[9];
     //featureMaintainer likely to remain unchanged
-    featureTrackerConfig.FeatureMaintainer.minimumDistanceBetweenFeatures = 50;
-    featureTrackerConfig.FeatureMaintainer.lostFeatureErrorThreshold = 50000;
-    featureTrackerConfig.FeatureMaintainer.trackedFeatureThreshold = 200000;
-    */
+    //featureTrackerConfig.FeatureMaintainer.minimumDistanceBetweenFeatures = 50;
+    //featureTrackerConfig.FeatureMaintainer.lostFeatureErrorThreshold = 50000;
+    //featureTrackerConfig.FeatureMaintainer.trackedFeatureThreshold = 200000;
+    
 
     featureTrackerLeft->initialConfig.set(featureTrackerConfig);
     featureTrackerRight->initialConfig.set(featureTrackerConfig);
@@ -339,20 +336,20 @@ int main(int argc, char **argv) {
     depth->setLeftRightCheck(true);
     depth->setExtendedDisparity(false);
     depth->setSubpixel(true);
-    depth->setSubpixelFractionalBits(FRAC_BITS_N); 
+    depth->setSubpixelFractionalBits(argv[4]); 
     depth->setDepthAlign(dai::RawStereoDepthConfig::AlgorithmControl::DepthAlign::RECTIFIED_LEFT);
     depth->setAlphaScaling(0);
     /*
-    depth->setRectification(true);
     possibly beneficial but potentional issues
     - disparity indexing still works?
     - normalized math works?
     */
+    depth->setRectification(argv[10]);
 
     // Accelerometer options: 15Hz, 31Hz, 62Hz, 125Hz, 250Hz 500Hz
-    imu->enableIMUSensor(dai::IMUSensor::ACCELEROMETER, 125);
+    imu->enableIMUSensor(dai::IMUSensor::ACCELEROMETER, argv[5]);
         // Gyroscope options: 25Hz, 33Hz, 50Hz, 100Hz, 200Hz, 400Hz; 100 might be the max for this option
-    imu->enableIMUSensor(dai::IMUSensor::GYROSCOPE_CALIBRATED, 100);
+    imu->enableIMUSensor(dai::IMUSensor::GYROSCOPE_CALIBRATED, argv[6]);
     // it's recommended to set both setBatchReportThreshold and setMaxBatchReports to 20 when integrating in a pipeline with a lot of input/output connections
     imu->setBatchReportThreshold(1);
     // maximum number of IMU packets in a batch, if it's reached device will block sending until host can receive it
@@ -408,6 +405,7 @@ int main(int argc, char **argv) {
     calc_rect_cam_intri_extri(calibData, &f, &cx, &cy);
     float hfov = 2 * atanf(CAM_W / (2 * f));
     float vfov = 2 * atanf(CAM_H / (2 * f));
+    // baseline equals to baseline amount in getBaselineDistance(bool=false)
     std::cout << "stereo baseline:" << baseline << " m, f:" << f << " px, cx:" << cx << ", cy:" << cy << " hfov:" << hfov * 180 / M_PI << " degrees, vfov:" << vfov * 180 / M_PI << " degrees\n";
 
     // variables for affine transformation
@@ -420,10 +418,11 @@ int main(int argc, char **argv) {
     double r_inv_k22 = 1.0 / f;
     double r_inv_k23 = -cy / f;
 
-    auto s_pairs = device.getAvailableStereoPairs();
-    for (auto& s_pair : s_pairs) {
-        std::cout << "(TEMPORARY PRINTOUT: possilbe stereo pair baseline:" << s_pair.baseline << " cm\n";
-    }
+    // prints 7,4996
+    // auto s_pairs = device.getAvailableStereoPairs();
+    // for (auto& s_pair : s_pairs) {
+    //     std::cout << "(TEMPORARY PRINTOUT: possilbe stereo pair baseline:" << s_pair.baseline << " cm\n";
+    // }
 
     // verbose logging
     //device.setLogOutputLevel(dai::LogLevel::DEBUG);
@@ -511,7 +510,7 @@ int main(int argc, char **argv) {
             //     cv::imshow(leftWindowName, leftFrame);
             // }
             //std::cout << "LEFT ft " << l_seq << " latency:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - features_tp).count() << " ms\n";
-            l_sum += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - features_tp).count();
+            l_sum += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - data->getTimestamp()).count();
             l_count += 1;
         } else if (q_name == "trackedFeaturesRight") {
             auto data = outputFeaturesRightQueue->get<dai::TrackedFeatures>();
@@ -568,16 +567,15 @@ int main(int argc, char **argv) {
                         imu_buf[5] = -gyro.y;
                         imu_buf[6] = -gyro.x;
                         ssize_t sent = sendto(ipc_sock, imu_buf, sizeof(imu_buf), 0, (struct sockaddr*)&imu_addr, sizeof(struct sockaddr_un));
-                        if (sent == -1) {
-                            perror("imu data send failed");
-                            camera_run = 0;
-                            break;
-                        }
+                        // if (sent == -1) {
+                        //     perror("imu data send failed");
+                        //     camera_run = 0;
+                        // }
                     }
-            // if (!imu_ok) {
-            //     imu_ok = true;
-            //     std::cout << "imu ok\n";
-            // }
+            //  if (!imu_ok) {
+            //      imu_ok = true;
+            //      std::cout << "imu ok\n";
+            //  }
         }
 
         if (l_seq == r_seq && r_seq == disp_seq) { // executes if left, right and disparity frames align
@@ -717,12 +715,13 @@ int main(int argc, char **argv) {
             if (c < MIN_FEATURES) std::cout << "WARNING: too few features: " << c << "\n";
             // sending features
             if (c > 0) {
-            //if (imu_ok && c > 0) {
-                features_msg[0] = static_cast<double>(c);
-                ssize_t sent = sendto(ipc_sock, features_msg.data(), static_cast<size_t>(2 + NUMBEROF_DATA * c) * sizeof(double), 0, (struct sockaddr*)&features_addr, sizeof(struct sockaddr_un));
-                if (sent == -1) {
-                    perror("features data send failed");
-                    camera_run = 0;
+                if (c > 0) { // && imu_ok
+                    features_msg[0] = static_cast<double>(c);
+                    ssize_t sent = sendto(ipc_sock, features_msg.data(), static_cast<size_t>(2 + NUMBEROF_DATA * c) * sizeof(double), 0, (struct sockaddr*)&features_addr, sizeof(struct sockaddr_un));
+                    // if (sent == -1) {
+                    //     perror("features data send failed");
+                    //     camera_run = 0;
+                    // }
                 }
             }
 
