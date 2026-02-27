@@ -1,4 +1,7 @@
 /*
+odstranit potencialni deleni nulou (rychlosti)
+je pDisp_frame16 safe? k zamysleni
+
 NUTNOST KAMERY:
 je float baseline redundantni?
 imu_ok zakomentovano uvidime co to udela
@@ -437,12 +440,14 @@ int main(int argc, char **argv) {
     // Input queue to send runtime FeatureTracker config updates (optional)
     auto inputFeatureTrackerConfigQueue = device.getInputQueue("trackedFeaturesConfig");
 
-    // Visualization windows / drawers
-    const auto leftWindowName = "left";
-    auto leftFeatureDrawer = FeatureTrackerDrawer("Feature tracking duration (frames)", leftWindowName);
+    //RPI IS MISSING cairo-xlib DEPENDENCY TO MAKE VISUALISATION POSSIBLE, IM NOT DEALING WITH THAT
 
-    const auto rightWindowName = "right";
-    auto rightFeatureDrawer = FeatureTrackerDrawer("Feature tracking duration (frames)", rightWindowName);
+    // Visualization windows / drawers
+    // const auto leftWindowName = "left";
+    // auto leftFeatureDrawer = FeatureTrackerDrawer("Feature tracking duration (frames)", leftWindowName);
+
+    // const auto rightWindowName = "right";
+    // auto rightFeatureDrawer = FeatureTrackerDrawer("Feature tracking duration (frames)", rightWindowName);
     // auto focalQueue = device.getOutputQueue("focal", 1, false); //here
 
     // sequence numbers initialisation
@@ -458,8 +463,8 @@ int main(int argc, char **argv) {
     std::unordered_map<int, dai::Point2f> r_cur_features; // right image current features indexed map
     std::chrono::time_point<std::chrono::steady_clock, std::chrono::steady_clock::duration> features_tp, prv_features_tp; // timestamps of frames
     std::unordered_map<int, int> lr_id_mapping; // features detected in left image paired to features in right
-    // Mats for visualization
-    cv::Mat leftFrame, rightFrame;
+    // Mats for visualization CURRENTLY UNAVAILABLE BECAUSE OF MISSING DEPENDENCY
+    // cv::Mat leftFrame, rightFrame;
 
     // Clear queue events
     //jakaskerl suggest remove this line
@@ -471,40 +476,40 @@ int main(int argc, char **argv) {
 
     while(camera_run) {
         auto q_name = device.getQueueEvent();
-        // Handle passthrough frames (display) - these are emitted by FeatureTracker passthroughInputImage
-        if (q_name == "passthroughFrameLeft") {
-            auto inPassthroughFrameLeft = passthroughImageLeftQueue->get<dai::ImgFrame>();
-            // DepthAI may be built without OpenCV helper support; get raw data and construct a cv::Mat
-            auto dataLeft = inPassthroughFrameLeft->getData();
-            int hLeft = inPassthroughFrameLeft->getHeight();
-            int wLeft = inPassthroughFrameLeft->getWidth();
-            cv::Mat passthroughFrameLeft(hLeft, wLeft, CV_8UC1, (void*)dataLeft.data());
-            cv::cvtColor(passthroughFrameLeft, leftFrame, cv::COLOR_GRAY2BGR);
-            // draw and show
-            leftFeatureDrawer.drawFeatures(leftFrame);
-            cv::imshow(leftWindowName, leftFrame);
-        } else if (q_name == "passthroughFrameRight") {
-            auto inPassthroughFrameRight = passthroughImageRightQueue->get<dai::ImgFrame>();
-            auto dataRight = inPassthroughFrameRight->getData();
-            int hRight = inPassthroughFrameRight->getHeight();
-            int wRight = inPassthroughFrameRight->getWidth();
-            cv::Mat passthroughFrameRight(hRight, wRight, CV_8UC1, (void*)dataRight.data());
-            cv::cvtColor(passthroughFrameRight, rightFrame, cv::COLOR_GRAY2BGR);
-            rightFeatureDrawer.drawFeatures(rightFrame);
-            cv::imshow(rightWindowName, rightFrame);
-        }
+        // Handle passthrough frames (display) - these are emitted by FeatureTracker passthroughInputImage CURRENTLY UNAVAILABLE
+        // if (q_name == "passthroughFrameLeft") {
+        //     auto inPassthroughFrameLeft = passthroughImageLeftQueue->get<dai::ImgFrame>();
+        //     // DepthAI may be built without OpenCV helper support; get raw data and construct a cv::Mat
+        //     auto dataLeft = inPassthroughFrameLeft->getData();
+        //     int hLeft = inPassthroughFrameLeft->getHeight();
+        //     int wLeft = inPassthroughFrameLeft->getWidth();
+        //     cv::Mat passthroughFrameLeft(hLeft, wLeft, CV_8UC1, (void*)dataLeft.data());
+        //     cv::cvtColor(passthroughFrameLeft, leftFrame, cv::COLOR_GRAY2BGR);
+        //     // draw and show
+        //     leftFeatureDrawer.drawFeatures(leftFrame);
+        //     cv::imshow(leftWindowName, leftFrame);
+        // } else if (q_name == "passthroughFrameRight") {
+        //     auto inPassthroughFrameRight = passthroughImageRightQueue->get<dai::ImgFrame>();
+        //     auto dataRight = inPassthroughFrameRight->getData();
+        //     int hRight = inPassthroughFrameRight->getHeight();
+        //     int wRight = inPassthroughFrameRight->getWidth();
+        //     cv::Mat passthroughFrameRight(hRight, wRight, CV_8UC1, (void*)dataRight.data());
+        //     cv::cvtColor(passthroughFrameRight, rightFrame, cv::COLOR_GRAY2BGR);
+        //     rightFeatureDrawer.drawFeatures(rightFrame);
+        //     cv::imshow(rightWindowName, rightFrame);
+        // }
 
         if (q_name == "trackedFeaturesLeft") { // waits until specified queue gets a message
             auto data = outputFeaturesLeftQueue->get<dai::TrackedFeatures>();
             l_features = data->trackedFeatures;
             l_seq = data->getSequenceNum(); // retrieve sequence number
             features_tp = data->getTimestampDevice(); // timestamp from camera
-            // update tracking paths for visualization
-            leftFeatureDrawer.trackFeaturePath(l_features);
-            if (!leftFrame.empty()) {
-                leftFeatureDrawer.drawFeatures(leftFrame);
-                cv::imshow(leftWindowName, leftFrame);
-            }
+            // update tracking paths for visualization CURRENTLY UNAVAILABLE
+            // leftFeatureDrawer.trackFeaturePath(l_features);
+            // if (!leftFrame.empty()) {
+            //     leftFeatureDrawer.drawFeatures(leftFrame);
+            //     cv::imshow(leftWindowName, leftFrame);
+            // }
             //std::cout << "LEFT ft " << l_seq << " latency:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - features_tp).count() << " ms\n";
             l_sum += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - features_tp).count();
             l_count += 1;
@@ -512,12 +517,12 @@ int main(int argc, char **argv) {
             auto data = outputFeaturesRightQueue->get<dai::TrackedFeatures>();
             r_features = data->trackedFeatures;
             r_seq = data->getSequenceNum();
-            // update tracking paths for visualization
-            rightFeatureDrawer.trackFeaturePath(r_features);
-            if (!rightFrame.empty()) {
-                rightFeatureDrawer.drawFeatures(rightFrame);
-                cv::imshow(rightWindowName, rightFrame);
-            }
+            // update tracking paths for visualization CURRENTLY UNAVAILABLE
+            // rightFeatureDrawer.trackFeaturePath(r_features);
+            // if (!rightFrame.empty()) {
+            //     rightFeatureDrawer.drawFeatures(rightFrame);
+            //     cv::imshow(rightWindowName, rightFrame);
+            // }
             //std::cout << "RIGHT ft " << r_seq << " latency:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - data->getTimestamp()).count() << " ms\n";
             r_sum += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - data->getTimestamp()).count();
             r_count += 1;
