@@ -1,16 +1,12 @@
 /*
 odstranit potencialni deleni nulou (rychlosti)
 je pDisp_frame16 safe? k zamysleni
+zobrazovani na pocitaci predelegovat
 
 NUTNOST KAMERY:
 CONFIG: jestli se CV rectification projevi jako zbytecna, bude odstranena pro rychlejsi loop - nahrazeni setRectification(True)
 
 imu_ok zakomentovano uvidime co to udela
-
-COLOR CAMERA:   IMX378  4056x3040   85@2024x1520
-MONO CAMERA:    OV9282  1280x800    THE_400_P: 255@640x400  THE_720_P: 143@1280x720 THE_800_P 129@1280x800  anti-banding mode*  3a algoritmy*
-
-latency with LR and subpixel according to documentation: 800P: 30.5ms 400P: 10.1ms
 */
 
 #include <iostream>
@@ -29,6 +25,8 @@ latency with LR and subpixel according to documentation: 800P: 30.5ms 400P: 10.1
 #include <string>
 #include <sys/un.h> // unix sockets
 #include <signal.h> // signal handling
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 // computer vision
 #include <opencv2/calib3d.hpp>
@@ -41,9 +39,6 @@ latency with LR and subpixel according to documentation: 800P: 30.5ms 400P: 10.1
 #include "deque"
 #include "unordered_map"
 
-// camera parameters as specified by THE_400_P
-#define CAM_W 640
-#define CAM_H 400
 #define PAIR_DIST_SQ 9 // threshold macro
 #define MIN_FEATURES 10
 #define TARGET_FEATURES 80 // 320 is the default from source
@@ -67,6 +62,10 @@ volatile sig_atomic_t camera_run = 1;
 void sig_func(int sig) {
     camera_run = 0;
 }
+
+// camera parameters as specified by THE_400_P
+static int CAM_W = 640;
+static int CAM_H = 400;
 
 // line color
 static const auto lineColor = cv::Scalar(200, 0, 200);
@@ -231,6 +230,10 @@ int main(int argc, char **argv) {
     //bool imu_ok = false;
     int num_frames=0; // number of frames
 
+    // set resolution according to argv if provided (argv[12]=width, argv[13]=height)
+    CAM_W = static_cast<int>(strtol(argv[12], NULL, 10));
+    CAM_H = static_cast<int>(strtol(argv[13], NULL, 10));
+
     // terminate process by calling SIGINT(Ctrl-C)
     struct sigaction act;
     memset(&act, 0, sizeof(act));
@@ -260,6 +263,30 @@ int main(int argc, char **argv) {
     memset(&features_addr, 0, sizeof(struct sockaddr_un));
     features_addr.sun_family = AF_UNIX;
     strcpy(features_addr.sun_path, "/tmp/chobits_features");
+
+    // Optional INET (UDP) socket to send features over network to remote visualiser
+    bool inet_enabled = false;
+    int inet_sock = -1;
+    struct sockaddr_in inet_addr_remote;
+    if(argc > 15 && argv[14] && argv[15]) {
+        const char* remote_host = argv[14];
+        int remote_port = static_cast<int>(strtol(argv[15], NULL, 10));
+        inet_sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if(inet_sock == -1) {
+            perror("inet socket creation failed");
+        } else {
+            memset(&inet_addr_remote, 0, sizeof(inet_addr_remote));
+            inet_addr_remote.sin_family = AF_INET;
+            inet_addr_remote.sin_port = htons(remote_port);
+            if(inet_pton(AF_INET, remote_host, &inet_addr_remote.sin_addr) != 1) {
+                std::cerr << "Invalid remote host IP: " << remote_host << "\n";
+                close(inet_sock);
+                inet_sock = -1;
+            } else {
+                inet_enabled = true;
+            }
+        }
+    }
 
     // Create pipeline
     dai::Pipeline pipeline;
@@ -293,10 +320,19 @@ int main(int argc, char **argv) {
     //xout_focal->setStreamName("focal"); //here
 
     // Properties
-    monoLeft->setResolution(dai::MonoCameraProperties::SensorResolution::THE_400_P);
+    // Map argv[11] (resolution selection) to DepthAI enum; default to THE_400_P
+    dai::MonoCameraProperties::SensorResolution res = dai::MonoCameraProperties::SensorResolution::THE_400_P;
+    if(argc > 11 && argv[11]) {
+        std::string r(argv[11]);
+        if(r == "THE_400_P") res = dai::MonoCameraProperties::SensorResolution::THE_400_P;
+        else if(r == "THE_720_P") res = dai::MonoCameraProperties::SensorResolution::THE_720_P;
+        else if(r == "THE_800_P") res = dai::MonoCameraProperties::SensorResolution::THE_800_P;
+        // add other enum string mappings as needed
+    }
+    monoLeft->setResolution(res);
     monoLeft->setCamera("left");
     monoLeft->setFps(strtol(argv[3],NULL,10));
-    monoRight->setResolution(dai::MonoCameraProperties::SensorResolution::THE_400_P);
+    monoRight->setResolution(res);
     monoRight->setCamera("right");
     monoRight->setFps(strtol(argv[3],NULL,10));
 
@@ -346,7 +382,7 @@ int main(int argc, char **argv) {
     - disparity indexing still works?
     - normalized math works?
     */
-    depth->setRectification(strtol(argv[10],NULL,10));
+    depth->setRectification(argv[10]);
 
     // Accelerometer options: 15Hz, 31Hz, 62Hz, 125Hz, 250Hz 500Hz
     imu->enableIMUSensor(dai::IMUSensor::ACCELEROMETER, strtol(argv[5],NULL,10));
@@ -720,6 +756,10 @@ int main(int argc, char **argv) {
                 if (c > 0) { // && imu_ok
                     features_msg[0] = static_cast<double>(c);
                     ssize_t sent = sendto(ipc_sock, features_msg.data(), static_cast<size_t>(2 + NUMBEROF_DATA * c) * sizeof(double), 0, (struct sockaddr*)&features_addr, sizeof(struct sockaddr_un));
+                    if(inet_enabled) {
+                        ssize_t sent2 = sendto(inet_sock, features_msg.data(), static_cast<size_t>(2 + NUMBEROF_DATA * c) * sizeof(double), 0, (struct sockaddr*)&inet_addr_remote, sizeof(inet_addr_remote));
+                        (void)sent2; // ignore for now
+                    }
                     // if (sent == -1) {
                     //     perror("features data send failed");
                     //     camera_run = 0;
@@ -743,6 +783,7 @@ int main(int argc, char **argv) {
     }
 
     close(ipc_sock);
+    if(inet_sock != -1) close(inet_sock);
     std::cout << "bye\n";
 
     return 0;
