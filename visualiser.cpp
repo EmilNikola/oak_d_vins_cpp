@@ -1,5 +1,6 @@
 #include <iostream>
 #include <vector>
+#include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <cerrno>
@@ -10,12 +11,30 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <poll.h>
+#include <opencv2/opencv.hpp>
 
 // Includes common necessary includes for development using depthai library
 #include "depthai/depthai.hpp"
 #include "deque"
 #include "unordered_map"
 #include "unordered_set"
+
+#define PAIR_DIST_SQ 9 // threshold macro
+#define MIN_FEATURES 10
+#define TARGET_FEATURES 80 // 320 is the default from source
+#define MAXIMUM_FEATURES 118
+#define FPS 20
+#define FRAC_BITS_N 3
+#define NUMBEROF_DATA 13
+
+static constexpr const char* FRAME_MAGIC = "VFRM";
+static constexpr std::uint8_t FRAME_SIDE_LEFT = 0;
+static constexpr std::uint8_t FRAME_SIDE_RIGHT = 1;
+static constexpr double DISPLAY_SCALE = 2.0;
+
+// camera parameters as specified by THE_400_P
+static int CAM_W = 640;
+static int CAM_H = 400;
 
 // line color
 static const auto lineColor = cv::Scalar(200, 0, 200);
@@ -42,6 +61,10 @@ class FeatureTrackerDrawer {
     // unimportant
     std::string trackbarName;
     std::string windowName;
+
+    static void onTrackbar(int pos, void*) {
+        trackedFeaturesPathLength = std::max(1, pos);
+    }
 
    public:
     // function that takes vector of newly tracked features, and stores them
@@ -103,8 +126,10 @@ class FeatureTrackerDrawer {
 
     // class constructor -- describe
     FeatureTrackerDrawer(std::string trackbarName, std::string windowName) : trackbarName(trackbarName), windowName(windowName) {
-        cv::namedWindow(windowName.c_str());
-        cv::createTrackbar(trackbarName.c_str(), windowName.c_str(), &trackedFeaturesPathLength, maxTrackedFeaturesPathLength, nullptr);
+        cv::namedWindow(windowName.c_str(), cv::WINDOW_NORMAL);
+        cv::resizeWindow(windowName.c_str(), static_cast<int>(CAM_W * DISPLAY_SCALE), static_cast<int>(CAM_H * DISPLAY_SCALE));
+        cv::createTrackbar(trackbarName.c_str(), windowName.c_str(), nullptr, maxTrackedFeaturesPathLength, FeatureTrackerDrawer::onTrackbar, nullptr);
+        cv::setTrackbarPos(trackbarName.c_str(), windowName.c_str(), trackedFeaturesPathLength);
     }
 };
 
@@ -116,7 +141,6 @@ int main(int argc, char** argv) {
 
     // Expect: visualiser <udp_port> [cam_w cam_h]
     int udp_port = 5005;
-    int CAM_W = 640;
     int CAM_H = 400;
     if(argc > 1 && argv[1]) udp_port = std::atoi(argv[1]);
     if(argc > 2 && argv[2]) CAM_W = std::atoi(argv[2]);
@@ -149,12 +173,72 @@ int main(int argc, char** argv) {
 
     const size_t BUF_SZ = 65536;
     std::vector<char> buf(BUF_SZ);
+    cv::Mat leftBg(CAM_H, CAM_W, CV_8UC3, cv::Scalar(0,0,0));
+    cv::Mat rightBg(CAM_H, CAM_W, CV_8UC3, cv::Scalar(0,0,0));
+    int lastFeatureCount = 0;
 
     while(true) {
+        // -------------------
+        struct pollfd pfd;
+        pfd.fd = sock;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+
+        int pr = poll(&pfd, 1, 50);  // 50ms refresh so GUI remains responsive
+        if(pr < 0) {
+            if(errno == EINTR) continue;
+            perror("poll");
+            break;
+        }
+
+        if(pr == 0 || !(pfd.revents & POLLIN)) {
+            cv::Mat leftFrame = leftBg.clone();
+            cv::Mat rightFrame = rightBg.clone();
+            leftFeatureDrawer.drawFeatures(leftFrame);
+            rightFeatureDrawer.drawFeatures(rightFrame);
+            cv::putText(leftFrame, "Waiting for UDP data on port " + std::to_string(udp_port), cv::Point(10, 25), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255,255,255), 1);
+            cv::putText(rightFrame, "Waiting for UDP data on port " + std::to_string(udp_port), cv::Point(10, 25), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255,255,255), 1);
+            cv::putText(leftFrame, "features: " + std::to_string(lastFeatureCount), cv::Point(10, 50), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255,255,255), 1);
+            cv::putText(rightFrame, "features: " + std::to_string(lastFeatureCount), cv::Point(10, 50), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255,255,255), 1);
+            cv::imshow(leftWindowName, leftFrame);
+            cv::imshow(rightWindowName, rightFrame);
+            int key = cv::waitKey(1);
+            if(key == 27) break;
+            continue;
+        }
+        // -------------------
+
         ssize_t n = recv(sock, buf.data(), buf.size(), 0);
         if(n <= 0) {
             if(n < 0) perror("recv");
-            // wait a little then continue
+            int key = cv::waitKey(1);
+            if(key == 27) break;
+            continue;
+        }
+
+        if(n > 5 && std::memcmp(buf.data(), FRAME_MAGIC, 4) == 0) {
+            std::uint8_t side = static_cast<std::uint8_t>(buf[4]);
+            std::vector<std::uint8_t> jpg(static_cast<size_t>(n) - 5);
+            std::memcpy(jpg.data(), buf.data() + 5, jpg.size());
+            cv::Mat decoded = cv::imdecode(jpg, cv::IMREAD_GRAYSCALE);
+            if(!decoded.empty()) {
+                cv::Mat bgr;
+                cv::cvtColor(decoded, bgr, cv::COLOR_GRAY2BGR);
+                if(bgr.cols != CAM_W || bgr.rows != CAM_H) {
+                    cv::resize(bgr, bgr, cv::Size(CAM_W, CAM_H));
+                }
+                if(side == FRAME_SIDE_LEFT) leftBg = bgr;
+                if(side == FRAME_SIDE_RIGHT) rightBg = bgr;
+            }
+
+            cv::Mat leftFrame = leftBg.clone();
+            cv::Mat rightFrame = rightBg.clone();
+            leftFeatureDrawer.drawFeatures(leftFrame);
+            rightFeatureDrawer.drawFeatures(rightFrame);
+            cv::putText(leftFrame, "features: " + std::to_string(lastFeatureCount), cv::Point(10,20), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255,255,255), 1);
+            cv::putText(rightFrame, "features: " + std::to_string(lastFeatureCount), cv::Point(10,20), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255,255,255), 1);
+            cv::imshow(leftWindowName, leftFrame);
+            cv::imshow(rightWindowName, rightFrame);
             int key = cv::waitKey(1);
             if(key == 27) break;
             continue;
@@ -172,14 +256,14 @@ int main(int argc, char** argv) {
 
         int c = static_cast<int>(std::round(v[0]));
         if(c < 0) c = 0;
+        lastFeatureCount = c;
         if(2 + (size_t)c * NUMBEROF_DATA > nd) {
             std::cerr << "Packet claims " << c << " features but has only " << nd << " doubles\n";
             continue;
         }
 
-        // Create blank frames (black)
-        cv::Mat leftFrame(CAM_H, CAM_W, CV_8UC3, cv::Scalar(0,0,0));
-        cv::Mat rightFrame(CAM_H, CAM_W, CV_8UC3, cv::Scalar(0,0,0));
+        cv::Mat leftFrame = leftBg.clone();
+        cv::Mat rightFrame = rightBg.clone();
 
         std::vector<dai::TrackedFeature> leftFeatures;
         std::vector<dai::TrackedFeature> rightFeatures;

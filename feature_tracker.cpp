@@ -1,12 +1,10 @@
 /*
 odstranit potencialni deleni nulou (rychlosti)
 je pDisp_frame16 safe? k zamysleni
-zobrazovani na pocitaci predelegovat
+pridat option na odstraneni veskereho overheadu spojeneho s odesilanim celych snimku
 
 NUTNOST KAMERY:
 CONFIG: jestli se CV rectification projevi jako zbytecna, bude odstranena pro rychlejsi loop - nahrazeni setRectification(True)
-
-imu_ok zakomentovano uvidime co to udela
 */
 
 #include <iostream>
@@ -32,6 +30,7 @@ imu_ok zakomentovano uvidime co to udela
 #include <opencv2/calib3d.hpp>
 // GUI / drawing
 #include <opencv2/highgui.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
 // Includes common necessary includes for development using depthai library
@@ -41,11 +40,24 @@ imu_ok zakomentovano uvidime co to udela
 
 #define PAIR_DIST_SQ 9 // threshold macro
 #define MIN_FEATURES 10
-#define TARGET_FEATURES 80 // 320 is the default from source
-#define MAXIMUM_FEATURES 118
-#define FPS 20
-#define FRAC_BITS_N 3
 #define NUMBEROF_DATA 13
+
+static constexpr const char* FRAME_MAGIC = "VFRM";
+static constexpr std::uint8_t FRAME_SIDE_LEFT = 0;
+static constexpr std::uint8_t FRAME_SIDE_RIGHT = 1;
+
+static void sendFramePacket(int inet_sock, const struct sockaddr_in& inet_addr_remote, const cv::Mat& gray, std::uint8_t side) {
+    std::vector<std::uint8_t> jpg;
+    cv::imencode(".jpg", gray, jpg, {cv::IMWRITE_JPEG_QUALITY, 60});
+    if(jpg.empty()) return;
+
+    std::vector<std::uint8_t> pkt(5 + jpg.size());
+    std::memcpy(pkt.data(), FRAME_MAGIC, 4);
+    pkt[4] = side;
+    std::memcpy(pkt.data() + 5, jpg.data(), jpg.size());
+
+    sendto(inet_sock, pkt.data(), pkt.size(), 0, (struct sockaddr*)&inet_addr_remote, sizeof(inet_addr_remote));
+}
 
 // 2D point location values
 // struct MyPoint2d {
@@ -227,7 +239,6 @@ class FeatureTrackerDrawer {
 int FeatureTrackerDrawer::trackedFeaturesPathLength = 10;
 
 int main(int argc, char **argv) {
-    //bool imu_ok = false;
     int num_frames=0; // number of frames
 
     // set resolution according to argv if provided (argv[12]=width, argv[13]=height)
@@ -513,28 +524,27 @@ int main(int argc, char **argv) {
 
     while(camera_run) {
         auto q_name = device.getQueueEvent();
-        // Handle passthrough frames (display) - these are emitted by FeatureTracker passthroughInputImage CURRENTLY UNAVAILABLE
-        // if (q_name == "passthroughFrameLeft") {
-        //     auto inPassthroughFrameLeft = passthroughImageLeftQueue->get<dai::ImgFrame>();
-        //     // DepthAI may be built without OpenCV helper support; get raw data and construct a cv::Mat
-        //     auto dataLeft = inPassthroughFrameLeft->getData();
-        //     int hLeft = inPassthroughFrameLeft->getHeight();
-        //     int wLeft = inPassthroughFrameLeft->getWidth();
-        //     cv::Mat passthroughFrameLeft(hLeft, wLeft, CV_8UC1, (void*)dataLeft.data());
-        //     cv::cvtColor(passthroughFrameLeft, leftFrame, cv::COLOR_GRAY2BGR);
-        //     // draw and show
-        //     leftFeatureDrawer.drawFeatures(leftFrame);
-        //     cv::imshow(leftWindowName, leftFrame);
-        // } else if (q_name == "passthroughFrameRight") {
-        //     auto inPassthroughFrameRight = passthroughImageRightQueue->get<dai::ImgFrame>();
-        //     auto dataRight = inPassthroughFrameRight->getData();
-        //     int hRight = inPassthroughFrameRight->getHeight();
-        //     int wRight = inPassthroughFrameRight->getWidth();
-        //     cv::Mat passthroughFrameRight(hRight, wRight, CV_8UC1, (void*)dataRight.data());
-        //     cv::cvtColor(passthroughFrameRight, rightFrame, cv::COLOR_GRAY2BGR);
-        //     rightFeatureDrawer.drawFeatures(rightFrame);
-        //     cv::imshow(rightWindowName, rightFrame);
-        // }
+        if (q_name == "passthroughFrameLeft") {
+            auto inPassthroughFrameLeft = passthroughImageLeftQueue->get<dai::ImgFrame>();
+            if(inet_enabled) {
+                auto dataLeft = inPassthroughFrameLeft->getData();
+                int hLeft = inPassthroughFrameLeft->getHeight();
+                int wLeft = inPassthroughFrameLeft->getWidth();
+                cv::Mat frameLeft(hLeft, wLeft, CV_8UC1, (void*)dataLeft.data());
+                sendFramePacket(inet_sock, inet_addr_remote, frameLeft, FRAME_SIDE_LEFT);
+            }
+            continue;
+        } else if (q_name == "passthroughFrameRight") {
+            auto inPassthroughFrameRight = passthroughImageRightQueue->get<dai::ImgFrame>();
+            if(inet_enabled) {
+                auto dataRight = inPassthroughFrameRight->getData();
+                int hRight = inPassthroughFrameRight->getHeight();
+                int wRight = inPassthroughFrameRight->getWidth();
+                cv::Mat frameRight(hRight, wRight, CV_8UC1, (void*)dataRight.data());
+                sendFramePacket(inet_sock, inet_addr_remote, frameRight, FRAME_SIDE_RIGHT);
+            }
+            continue;
+        }
 
         if (q_name == "trackedFeaturesLeft") { // waits until specified queue gets a message
             auto data = outputFeaturesLeftQueue->get<dai::TrackedFeatures>();
@@ -610,10 +620,6 @@ int main(int argc, char **argv) {
                         //     camera_run = 0;
                         // }
                     }
-            //  if (!imu_ok) {
-            //      imu_ok = true;
-            //      std::cout << "imu ok\n";
-            //  }
         }
 
         if (l_seq == r_seq && r_seq == disp_seq) { // executes if left, right and disparity frames align
@@ -624,7 +630,7 @@ int main(int argc, char **argv) {
             std::unordered_map<int , dai::Point2f> features;
             int c = 0;
             // prepare a local buffer: [count, timestamp, feature blocks...]
-            std::vector<double> features_msg(2 + NUMBEROF_DATA * MAXIMUM_FEATURES);
+            std::vector<double> features_msg(2 + NUMBEROF_DATA * strtol(argv[2],NULL,10));
             features_msg[1] = std::chrono::duration<double>(features_tp.time_since_epoch()).count(); // duration between epoch and timestamp of frame expressed in seconds
             size_t buf_index = 2; // first two slots are occupied with timestamps
             for (const auto &l_feature : l_features) {
@@ -670,7 +676,7 @@ int main(int argc, char **argv) {
                         features_msg[buf_index + 11] = vx;
                         features_msg[buf_index + 12] = vy;
 
-                        if (c < MAXIMUM_FEATURES) { // maximum number of features
+                        if (c < strtol(argv[2],NULL,10)) { // maximum number of features
                             ++c;
                             buf_index += NUMBEROF_DATA; // move to next position in buffer accordingly
                         }
@@ -725,7 +731,7 @@ int main(int argc, char **argv) {
                             features_msg[buf_index + 11] = vx;
                             features_msg[buf_index + 12] = vy;
 
-                            if (c < MAXIMUM_FEATURES) {
+                            if (c < strtol(argv[2],NULL,10)) {
                                 ++c;
                                 buf_index += NUMBEROF_DATA;
                             }
@@ -752,33 +758,34 @@ int main(int argc, char **argv) {
             }
             if (c < MIN_FEATURES) std::cout << "WARNING: too few features: " << c << "\n";
             // sending features
+            size_t featurePayloadBytes = static_cast<size_t>(2 + NUMBEROF_DATA * c) * sizeof(double);
             if (c > 0) {
-                if (c > 0) { // && imu_ok
-                    features_msg[0] = static_cast<double>(c);
-                    ssize_t sent = sendto(ipc_sock, features_msg.data(), static_cast<size_t>(2 + NUMBEROF_DATA * c) * sizeof(double), 0, (struct sockaddr*)&features_addr, sizeof(struct sockaddr_un));
-                    if(inet_enabled) {
-                        ssize_t sent2 = sendto(inet_sock, features_msg.data(), static_cast<size_t>(2 + NUMBEROF_DATA * c) * sizeof(double), 0, (struct sockaddr*)&inet_addr_remote, sizeof(inet_addr_remote));
-                        (void)sent2; // ignore for now
-                    }
-                    // if (sent == -1) {
-                    //     perror("features data send failed");
-                    //     camera_run = 0;
-                    // }
+                features_msg[0] = static_cast<double>(c);
+                ssize_t sent = sendto(ipc_sock, features_msg.data(), featurePayloadBytes, 0, (struct sockaddr*)&features_addr, sizeof(struct sockaddr_un));
+                // if (sent == -1) {
+                //     perror("features data send failed");
+                //     camera_run = 0;
+                // }
+
+                // current frame moved to previous to make place for new frame
+                l_prv_features = features;
+                prv_features_tp = features_tp;
+                r_prv_features.clear();
+                for (const auto &r_feature : r_features) {
+                    r_prv_features[r_feature.id] = dai::Point2f(
+                        static_cast<float>(r_inv_k11 * r_feature.position.x + r_inv_k13),
+                        static_cast<float>(r_inv_k22 * r_feature.position.y + r_inv_k23)
+                    );
                 }
+                //auto t2 = std::chrono::steady_clock::now();
+                //std::cout << pp_msg.points.size() << " points, " << std::chrono::duration<float, std::milli>(t2-t1).count() << " ms\n";
             }
 
-            // current frame moved to previous to make place for new frame
-            l_prv_features = features;
-            prv_features_tp = features_tp;
-            r_prv_features.clear();
-            for (const auto &r_feature : r_features) {
-                r_prv_features[r_feature.id] = dai::Point2f(
-                    static_cast<float>(r_inv_k11 * r_feature.position.x + r_inv_k13),
-                    static_cast<float>(r_inv_k22 * r_feature.position.y + r_inv_k23)
-                );
+            if(inet_enabled) {
+                features_msg[0] = static_cast<double>(c);
+                ssize_t sent2 = sendto(inet_sock, features_msg.data(), featurePayloadBytes, 0, (struct sockaddr*)&inet_addr_remote, sizeof(inet_addr_remote));
+                (void)sent2; // ignore for now
             }
-            //auto t2 = std::chrono::steady_clock::now();
-            //std::cout << pp_msg.points.size() << " points, " << std::chrono::duration<float, std::milli>(t2-t1).count() << " ms\n";
         }
     }
 
