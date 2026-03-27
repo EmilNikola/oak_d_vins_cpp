@@ -2,6 +2,7 @@
 odstranit potencialni deleni nulou (rychlosti)
 je pDisp_frame16 safe? k zamysleni
 pridat option na odstraneni veskereho overheadu spojeneho s odesilanim celych snimku
+not rly sure about the framerate na featurach, na to se asi jeste blize podivam jestli je moje logika spravna
 
 NUTNOST KAMERY:
 CONFIG: jestli se CV rectification projevi jako zbytecna, bude odstranena pro rychlejsi loop - nahrazeni setRectification(True)
