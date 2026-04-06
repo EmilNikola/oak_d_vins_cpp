@@ -10,6 +10,7 @@ CONFIG: jestli se CV rectification projevi jako zbytecna, bude odstranena pro ry
 */
 
 #include <iostream>
+#include <algorithm>
 #include <chrono>
 #include <vector>
 #include <cstdint>
@@ -358,6 +359,9 @@ int main(int argc, char **argv) {
     auto imu = pipeline.create<dai::node::IMU>();
     auto depth = pipeline.create<dai::node::StereoDepth>();
 
+    // Resize left passthrough on-device so unix-dgram VFRM packets fit (avoid EMSGSIZE)
+    auto manipPassthroughLeft = pipeline.create<dai::node::ImageManip>();
+
     auto xoutTrackedFeaturesLeft = pipeline.create<dai::node::XLinkOut>();
     auto xoutTrackedFeaturesRight = pipeline.create<dai::node::XLinkOut>();
     auto xoutPassthroughFrameLeft = pipeline.create<dai::node::XLinkOut>();
@@ -393,6 +397,15 @@ int main(int argc, char **argv) {
     monoRight->setResolution(res);
     monoRight->setCamera("right");
     monoRight->setFps(strtol(argv[3],NULL,10));
+
+    // Configure on-device resize for left passthrough stream (frames sent over /tmp/chobits_frames).
+    // NOTE: Sensor resolution remains THE_400_P etc for tracking/disp; only the HOST passthrough is resized.
+    // Keep CAM_W/CAM_H from argv (global defaults at top of file).
+    if(CAM_W > 0 && CAM_H > 0) {
+        manipPassthroughLeft->initialConfig.setResize(CAM_W, CAM_H);
+        // Ensure device allocates enough memory for the resized output (mono8 expected)
+        manipPassthroughLeft->setMaxOutputFrameSize(static_cast<std::uint32_t>(CAM_W * CAM_H));
+    }
 
 
     // Initializes motion estimator to LucasKanade
@@ -457,7 +470,9 @@ int main(int argc, char **argv) {
     // Linking
     monoLeft->out.link(depth->left);
     depth->rectifiedLeft.link(featureTrackerLeft->inputImage);
-    featureTrackerLeft->passthroughInputImage.link(xoutPassthroughFrameLeft->input);
+    // Route passthrough through ImageManip to downscale on-device (prevents EMSGSIZE on unix datagram)
+    featureTrackerLeft->passthroughInputImage.link(manipPassthroughLeft->inputImage);
+    manipPassthroughLeft->out.link(xoutPassthroughFrameLeft->input);
     featureTrackerLeft->outputFeatures.link(xoutTrackedFeaturesLeft->input);
 
     monoRight->out.link(depth->right);
