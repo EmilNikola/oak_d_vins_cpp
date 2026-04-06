@@ -3,6 +3,7 @@ odstranit potencialni deleni nulou (rychlosti)
 je pDisp_frame16 safe? k zamysleni
 pridat option na odstraneni veskereho overheadu spojeneho s odesilanim celych snimku
 not rly sure about the framerate na featurach, na to se asi jeste blize podivam jestli je moje logika spravna
+odstraneni obrazu samotneho bude mozna lepsi pro sledovani featur samotnych a pro testovani jako takove (je mi asi celkem jedno na cem se ty featury chytily)
 
 NUTNOST KAMERY:
 CONFIG: jestli se CV rectification projevi jako zbytecna, bude odstranena pro rychlejsi loop - nahrazeni setRectification(True)
@@ -21,6 +22,7 @@ CONFIG: jestli se CV rectification projevi jako zbytecna, bude odstranena pro ry
 #include <sys/socket.h> // communication endpoints
 #include <unistd.h> // posix api
 #include <string.h>
+#include <errno.h>
 #include <string>
 #include <sys/un.h> // unix sockets
 #include <signal.h> // signal handling
@@ -43,21 +45,60 @@ CONFIG: jestli se CV rectification projevi jako zbytecna, bude odstranena pro ry
 #define MIN_FEATURES 10
 #define NUMBEROF_DATA 13
 
-static constexpr const char* FRAME_MAGIC = "VFRM";
-static constexpr std::uint8_t FRAME_SIDE_LEFT = 0;
-static constexpr std::uint8_t FRAME_SIDE_RIGHT = 1;
+// -----------------------
+// VFRM packet format (mono8) for consumer processes
+// -----------------------
+#pragma pack(push, 1)
+struct VfrmHeader {
+    uint32_t magic;   // 'VFRM' = 0x5646524D
+    uint16_t version; // 1
+    uint16_t flags;   // optional: side info (0=left)
+    double stamp;     // seconds
+    uint32_t width;
+    uint32_t height;
+    uint32_t format;  // 0=mono8
+    uint32_t data_len;
+};
+#pragma pack(pop)
 
-static void sendFramePacket(int inet_sock, const struct sockaddr_in& inet_addr_remote, const cv::Mat& gray, std::uint8_t side) {
-    std::vector<std::uint8_t> jpg;
-    cv::imencode(".jpg", gray, jpg, {cv::IMWRITE_JPEG_QUALITY, 60});
-    if(jpg.empty()) return;
+static constexpr uint32_t VFRM_MAGIC = 0x5646524D; // 'VFRM'
+static constexpr uint16_t VFRM_VERSION = 1;
+static constexpr uint32_t VFRM_FORMAT_MONO8 = 0;
+static constexpr std::uint16_t VFRM_FLAG_LEFT = 0;
 
-    std::vector<std::uint8_t> pkt(5 + jpg.size());
-    std::memcpy(pkt.data(), FRAME_MAGIC, 4);
-    pkt[4] = side;
-    std::memcpy(pkt.data() + 5, jpg.data(), jpg.size());
+static void sendVfrmMono8Unix(int sock,
+                              const struct sockaddr_un& dst,
+                              const cv::Mat& gray,
+                              double stamp_seconds,
+                              std::uint16_t flags = VFRM_FLAG_LEFT) {
+    if(sock < 0) return;
+    if(gray.empty()) return;
+    if(gray.type() != CV_8UC1) return;
 
-    sendto(inet_sock, pkt.data(), pkt.size(), 0, (struct sockaddr*)&inet_addr_remote, sizeof(inet_addr_remote));
+    cv::Mat contig = gray;
+    if(!contig.isContinuous())
+        contig = gray.clone();
+
+    VfrmHeader hdr{};
+    hdr.magic = VFRM_MAGIC;
+    hdr.version = VFRM_VERSION;
+    hdr.flags = flags;
+    hdr.stamp = stamp_seconds;
+    hdr.width = (uint32_t)contig.cols;
+    hdr.height = (uint32_t)contig.rows;
+    hdr.format = VFRM_FORMAT_MONO8;
+    hdr.data_len = (uint32_t)contig.total(); // mono8: 1 byte per pixel
+
+    std::vector<uint8_t> pkt(sizeof(VfrmHeader) + hdr.data_len);
+    std::memcpy(pkt.data(), &hdr, sizeof(hdr));
+    std::memcpy(pkt.data() + sizeof(hdr), contig.data, hdr.data_len);
+
+    ssize_t sent = sendto(sock, pkt.data(), pkt.size(), 0,
+                          (const struct sockaddr*)&dst, sizeof(dst));
+    if(sent < 0) {
+        // best-effort; do not terminate pipeline on transient send errors
+        (void)errno;
+    }
 }
 
 // 2D point location values
@@ -254,7 +295,7 @@ int main(int argc, char **argv) {
 
     // creating unix socket ,ipc_local_addr to send and receive points features_addr, imu_addr
 
-    struct sockaddr_un ipc_local_addr, imu_addr, features_addr;
+    struct sockaddr_un ipc_local_addr, imu_addr, features_addr, frames_addr;
     unlink("/tmp/chobits_2222");
     memset(&ipc_local_addr, 0, sizeof(struct sockaddr_un));
     ipc_local_addr.sun_family = AF_UNIX;
@@ -275,6 +316,11 @@ int main(int argc, char **argv) {
     memset(&features_addr, 0, sizeof(struct sockaddr_un));
     features_addr.sun_family = AF_UNIX;
     strcpy(features_addr.sun_path, "/tmp/chobits_features");
+
+    // Unix socket destination for raw frames (VFRM)
+    memset(&frames_addr, 0, sizeof(frames_addr));
+    frames_addr.sun_family = AF_UNIX;
+    strcpy(frames_addr.sun_path, "/tmp/chobits_frames");
 
     // Optional INET (UDP) socket to send features over network to remote visualiser
     bool inet_enabled = false;
@@ -527,23 +573,18 @@ int main(int argc, char **argv) {
         auto q_name = device.getQueueEvent();
         if (q_name == "passthroughFrameLeft") {
             auto inPassthroughFrameLeft = passthroughImageLeftQueue->get<dai::ImgFrame>();
-            if(inet_enabled) {
-                auto dataLeft = inPassthroughFrameLeft->getData();
-                int hLeft = inPassthroughFrameLeft->getHeight();
-                int wLeft = inPassthroughFrameLeft->getWidth();
-                cv::Mat frameLeft(hLeft, wLeft, CV_8UC1, (void*)dataLeft.data());
-                sendFramePacket(inet_sock, inet_addr_remote, frameLeft, FRAME_SIDE_LEFT);
-            }
+            // send LEFT mono8 raw frame over unix socket as VFRM (best-effort)
+            auto dataLeft = inPassthroughFrameLeft->getData();
+            int hLeft = inPassthroughFrameLeft->getHeight();
+            int wLeft = inPassthroughFrameLeft->getWidth();
+            cv::Mat frameLeft(hLeft, wLeft, CV_8UC1, (void*)dataLeft.data());
+            double ts = std::chrono::duration<double>(inPassthroughFrameLeft->getTimestampDevice().time_since_epoch()).count();
+            sendVfrmMono8Unix(ipc_sock, frames_addr, frameLeft, ts, VFRM_FLAG_LEFT);
             continue;
         } else if (q_name == "passthroughFrameRight") {
+            // consume right passthrough frame but do not send it (not required by consumer)
             auto inPassthroughFrameRight = passthroughImageRightQueue->get<dai::ImgFrame>();
-            if(inet_enabled) {
-                auto dataRight = inPassthroughFrameRight->getData();
-                int hRight = inPassthroughFrameRight->getHeight();
-                int wRight = inPassthroughFrameRight->getWidth();
-                cv::Mat frameRight(hRight, wRight, CV_8UC1, (void*)dataRight.data());
-                sendFramePacket(inet_sock, inet_addr_remote, frameRight, FRAME_SIDE_RIGHT);
-            }
+            (void)inPassthroughFrameRight;
             continue;
         }
 
