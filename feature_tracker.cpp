@@ -1,9 +1,8 @@
 /*
 odstranit potencialni deleni nulou (rychlosti)
 je pDisp_frame16 safe? k zamysleni
-pridat option na odstraneni veskereho overheadu spojeneho s odesilanim celych snimku
 not rly sure about the framerate na featurach, na to se asi jeste blize podivam jestli je moje logika spravna
-odstraneni obrazu samotneho bude mozna lepsi pro sledovani featur samotnych a pro testovani jako takove (je mi asi celkem jedno na cem se ty featury chytily)
+extended disparity neni implementovana a mozna by nekdo moh kdyby chtel
 
 NUTNOST KAMERY:
 CONFIG: jestli se CV rectification projevi jako zbytecna, bude odstranena pro rychlejsi loop - nahrazeni setRectification(True)
@@ -15,6 +14,7 @@ CONFIG: jestli se CV rectification projevi jako zbytecna, bude odstranena pro ry
 #include <vector>
 #include <cstdint>
 #include <cstdlib>
+#include <utility>
 #include <string>
 
 #include <math.h>
@@ -67,6 +67,9 @@ static constexpr uint16_t VFRM_VERSION = 1;
 static constexpr uint32_t VFRM_FORMAT_MONO8 = 0;
 static constexpr std::uint16_t VFRM_FLAG_LEFT = 0;
 
+// The frame-sending helper can be excluded at compile time by defining OPT.
+// Although the way this is built, specifying buildtime macros is highly unlikely
+#ifndef OPT
 static void sendVfrmMono8Unix(int sock,
                               const struct sockaddr_un& dst,
                               const cv::Mat& gray,
@@ -101,6 +104,7 @@ static void sendVfrmMono8Unix(int sock,
         (void)errno;
     }
 }
+#endif
 
 // 2D point location values
 // struct MyPoint2d {
@@ -347,6 +351,14 @@ int main(int argc, char **argv) {
         }
     }
 
+        // Runtime option: if an extra cmdline argument (argv[16]) is provided and equals "0",
+        // disable sending of full frames at runtime. This works together with the compile-time
+        // guard OPT: if OPT is defined, the send function and call sites are removed.
+        bool opt_send_vfrm = true;
+        if(argc > 16 && argv[16]) {
+            if(std::string(argv[16]) == "0") opt_send_vfrm = false;
+        }
+
     // Create pipeline
     dai::Pipeline pipeline;
 
@@ -394,9 +406,11 @@ int main(int argc, char **argv) {
     monoLeft->setResolution(res);
     monoLeft->setCamera("left");
     monoLeft->setFps(strtol(argv[3],NULL,10));
+    monoLeft->setIsp3aFps(0); // matches camera FPS
     monoRight->setResolution(res);
     monoRight->setCamera("right");
     monoRight->setFps(strtol(argv[3],NULL,10));
+    monoRight->setIsp3aFps(0); // matches camera FPS
 
     // Configure on-device resize for left passthrough stream (frames sent over /tmp/chobits_frames).
     // NOTE: Sensor resolution remains THE_400_P etc for tracking/disp; only the HOST passthrough is resized.
@@ -541,12 +555,12 @@ int main(int argc, char **argv) {
 
     // Output queues used to receive the results
     // 3rd argument when false specifies that old messages are overwritten when the queue is full
-    auto outputFeaturesLeftQueue = device.getOutputQueue("trackedFeaturesLeft", 4, false); // size of queue, increased slightly to reduce jitter
-    auto outputFeaturesRightQueue = device.getOutputQueue("trackedFeaturesRight", 4, false);
-    auto passthroughImageLeftQueue = device.getOutputQueue("passthroughFrameLeft", 4, false);
-    auto passthroughImageRightQueue = device.getOutputQueue("passthroughFrameRight", 4, false);
-    auto disp_queue = device.getOutputQueue("disparity", 4, false);
-    auto imuQueue = device.getOutputQueue("imu", 5, false);
+    auto outputFeaturesLeftQueue = device.getOutputQueue("trackedFeaturesLeft", 8, false); // size of queue, increased slightly to reduce jitter
+    auto outputFeaturesRightQueue = device.getOutputQueue("trackedFeaturesRight", 8, false);
+    auto passthroughImageLeftQueue = device.getOutputQueue("passthroughFrameLeft", 8, false);
+    auto passthroughImageRightQueue = device.getOutputQueue("passthroughFrameRight", 8, false);
+    auto disp_queue = device.getOutputQueue("disparity", 8, false);
+    auto imuQueue = device.getOutputQueue("imu", 8, false);
     // Input queue to send runtime FeatureTracker config updates (optional)
     auto inputFeatureTrackerConfigQueue = device.getInputQueue("trackedFeaturesConfig");
 
@@ -588,13 +602,18 @@ int main(int argc, char **argv) {
         auto q_name = device.getQueueEvent();
         if (q_name == "passthroughFrameLeft") {
             auto inPassthroughFrameLeft = passthroughImageLeftQueue->get<dai::ImgFrame>();
-            // send LEFT mono8 raw frame over unix socket as VFRM (best-effort)
-            auto dataLeft = inPassthroughFrameLeft->getData();
-            int hLeft = inPassthroughFrameLeft->getHeight();
-            int wLeft = inPassthroughFrameLeft->getWidth();
-            cv::Mat frameLeft(hLeft, wLeft, CV_8UC1, (void*)dataLeft.data());
-            double ts = std::chrono::duration<double>(inPassthroughFrameLeft->getTimestampDevice().time_since_epoch()).count();
-            sendVfrmMono8Unix(ipc_sock, frames_addr, frameLeft, ts, VFRM_FLAG_LEFT);
+            (void)inPassthroughFrameLeft; // stop compiler warning about unused variable
+#ifndef OPT
+            if(opt_send_vfrm) {
+                // send LEFT mono8 raw frame over unix socket as VFRM (best-effort)
+                auto dataLeft = inPassthroughFrameLeft->getData();
+                int hLeft = inPassthroughFrameLeft->getHeight();
+                int wLeft = inPassthroughFrameLeft->getWidth();
+                cv::Mat frameLeft(hLeft, wLeft, CV_8UC1, (void*)dataLeft.data());
+                double ts = std::chrono::duration<double>(inPassthroughFrameLeft->getTimestampDevice().time_since_epoch()).count();
+                sendVfrmMono8Unix(ipc_sock, frames_addr, frameLeft, ts, VFRM_FLAG_LEFT);
+            }
+#endif
             continue;
         } else if (q_name == "passthroughFrameRight") {
             // consume right passthrough frame but do not send it (not required by consumer)
@@ -605,7 +624,8 @@ int main(int argc, char **argv) {
 
         if (q_name == "trackedFeaturesLeft") { // waits until specified queue gets a message
             auto data = outputFeaturesLeftQueue->get<dai::TrackedFeatures>();
-            l_features = data->trackedFeatures;
+            // move vector contents from the message to avoid element-wise copy
+            l_features = std::move(data->trackedFeatures);
             l_seq = data->getSequenceNum(); // retrieve sequence number
             features_tp = data->getTimestampDevice(); // timestamp from camera
             // update tracking paths for visualization CURRENTLY UNAVAILABLE
@@ -619,7 +639,8 @@ int main(int argc, char **argv) {
             l_count += 1;
         } else if (q_name == "trackedFeaturesRight") {
             auto data = outputFeaturesRightQueue->get<dai::TrackedFeatures>();
-            r_features = data->trackedFeatures;
+            // move vector contents from the message to avoid element-wise copy
+            r_features = std::move(data->trackedFeatures);
             r_seq = data->getSequenceNum();
             // update tracking paths for visualization CURRENTLY UNAVAILABLE
             // rightFeatureDrawer.trackFeaturePath(r_features);
@@ -637,7 +658,8 @@ int main(int argc, char **argv) {
         } else if (q_name == "disparity") {
             auto disp_data = disp_queue->get<dai::ImgFrame>();
             disp_seq = disp_data->getSequenceNum();
-            disp_frame = disp_data->getData(); // return only disparity data from frame
+            // move disparity buffer out of the frame to avoid a full copy
+            disp_frame = std::move(disp_data->getData()); // return only disparity data from frame
             pDisp_frame16 = (uint16_t*)disp_frame.data();
             // std::cout << "stereo " << disp_seq << " latency:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - disp_data->getTimestamp()).count() << " ms\n";
             disp_sum += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - disp_data->getTimestamp()).count();
