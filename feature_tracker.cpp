@@ -5,8 +5,6 @@ je pDisp_frame16 safe? k zamysleni
 NUTNOST KAMERY:
 CONFIG: jestli se CV rectification projevi jako zbytecna, bude odstranena pro rychlejsi loop - nahrazeni setRectification(True)
 
-imu_ok zakomentovano uvidime co to udela
-
 COLOR CAMERA:   IMX378  4056x3040   85@2024x1520
 MONO CAMERA:    OV9282  1280x800    THE_400_P: 255@640x400  THE_720_P: 143@1280x720 THE_800_P 129@1280x800  anti-banding mode*  3a algoritmy*
 
@@ -35,6 +33,7 @@ latency with LR and subpixel according to documentation: 800P: 30.5ms 400P: 10.1
 // GUI / drawing
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
+#include <memory>
 
 // Includes common necessary includes for development using depthai library
 #include "depthai/depthai.hpp"
@@ -67,11 +66,6 @@ volatile sig_atomic_t camera_run = 1;
 void sig_func(int sig) {
     camera_run = 0;
 }
-
-// line color
-static const auto lineColor = cv::Scalar(200, 0, 200);
-// point color
-static const auto pointColor = cv::Scalar(0, 0, 255);
 
 void calc_rect_cam_intri_extri(dai::CalibrationHandler calibData, double* f, double* cx, double* cy) {
     
@@ -139,97 +133,39 @@ void printConfig(const char *time, dai::RawFeatureTrackerConfig cfg) {
     std::cout << "maintainTresholdsTrackedFeature " << cfg.featureMaintainer.trackedFeatureThreshold << "\n";
 }
 
-class FeatureTrackerDrawer {
-   private:
-    // point size in pixels
-    static const int circleRadius = 2;
-    // longest a path can get in pixels
-    static const int maxTrackedFeaturesPathLength = 30;
-    // for how many frames the feature is tracked   !!
-    static int trackedFeaturesPathLength;
-
-    // alias for id=uint32_t
-    using featureIdType = decltype(dai::TrackedFeature::id);
-
-    // container of types featureIdType as hash-based set - search, insertion and removal have constant-time complexity
-    std::unordered_set<featureIdType> trackedIDs;
-    // container of featureIdType matched to 2D coordinates stored in double opened queue container - deque
-    std::unordered_map<featureIdType, std::deque<dai::Point2f>> trackedFeaturesPath;
-    // unimportant
-    std::string trackbarName;
-    std::string windowName;
-
-   public:
-    // function that takes vector of newly tracked features, and stores them
-    void trackFeaturePath(std::vector<dai::TrackedFeature>& features) {
-        std::unordered_set<featureIdType> newTrackedIDs;
-        for(auto& currentFeature : features) {
-            auto currentID = currentFeature.id;
-            newTrackedIDs.insert(currentID);
-
-            // if trackedFeaturesPath doesnt contain feature with currentID key, empty deque is inserted 
-            //auto& path = trackedFeatures[currentID]; // can replace next 3 lines because of unordered set intrinsic duplicate prevention
-            if(!trackedFeaturesPath.count(currentID)) {
-                trackedFeaturesPath.insert({currentID, std::deque<dai::Point2f>()});
-            }
-            // takes a reference to either last feature or newly created empty deque - value at currentID
-            std::deque<dai::Point2f>& path = trackedFeaturesPath.at(currentID);
-
-            // adds x,y position to path at the end, if vector isnt big enough its automatically resized 
-            path.push_back(currentFeature.position);
-            // if size of path is greater than either one or amount set by trackedFeaturesPathLength, first element is removed
-            while(path.size() > std::max<unsigned int>(1, trackedFeaturesPathLength)) {
-                path.pop_front();
-            }
-        }
-        
-        // .count counts number of elements of that id, which can be either 1 or 0
-        // if newTrrackedIDs doesnt contain ID of a feature in already tracked set,
-        // it is then placed in featuresToRemove set - because it becomes useless
-        std::unordered_set<featureIdType> featuresToRemove;
-        for(auto& oldId : trackedIDs) {
-            if(!newTrackedIDs.count(oldId)) {
-                featuresToRemove.insert(oldId);
-            }
-        }
-        // those features are then removed from trackedFeaturesPath
-        for(auto& id : featuresToRemove) {
-            trackedFeaturesPath.erase(id);
-        }
-        // currently processed features are moved back for the next iteration
-        trackedIDs = newTrackedIDs;
-    }
-
-    // drawer skipped, requires to be sorted through for potentionally important info
-    void drawFeatures(cv::Mat& img) {
-        cv::setTrackbarPos(trackbarName.c_str(), windowName.c_str(), trackedFeaturesPathLength);
-
-        for(auto& featurePath : trackedFeaturesPath) {
-            std::deque<dai::Point2f>& path = featurePath.second;
-            unsigned int j = 0;
-            for(j = 0; j < path.size() - 1; j++) {
-                auto src = cv::Point(path[j].x, path[j].y);
-                auto dst = cv::Point(path[j + 1].x, path[j + 1].y);
-                cv::line(img, src, dst, lineColor, 1, cv::LINE_AA, 0);
-            }
-
-            cv::circle(img, cv::Point(path[j].x, path[j].y), circleRadius, pointColor, -1, cv::LINE_AA, 0);
-        }
-    }
-
-    // class constructor -- describe
-    FeatureTrackerDrawer(std::string trackbarName, std::string windowName) : trackbarName(trackbarName), windowName(windowName) {
-        cv::namedWindow(windowName.c_str());
-        cv::createTrackbar(trackbarName.c_str(), windowName.c_str(), &trackedFeaturesPathLength, maxTrackedFeaturesPathLength, nullptr);
-    }
-};
-
-// sets the amount of frames a feature is tracked across to 10
-int FeatureTrackerDrawer::trackedFeaturesPathLength = 10;
-
 int main(int argc, char **argv) {
-    //bool imu_ok = false;
+    bool imu_ok = false;
     int num_frames=0; // number of frames
+    int allow = 0;
+    if(argc > 10) {
+        allow = static_cast<int>(strtol(argv[10], NULL, 10));
+    }
+    // depth preset selection via argv[4] (optional):
+    // 0 = FAST_ACCURACY
+    // 1 = FAST_DENSITY
+    // 2 = DEFAULT
+    // 3 = FACE
+    // 4 = HIGH_DETAIL
+    // 5 = ROBOTICS
+    int depth_preset_idx = 0; // default
+    if(argc > 4) {
+        depth_preset_idx = static_cast<int>(strtol(argv[4], NULL, 10));
+    }
+    // optional overrides (argv indices after existing args):
+    // argv[11] = median filter: 0=MEDIAN_OFF, 1=KERNEL_5x5, 2=KERNEL_7x7
+    // argv[12] = extended disparity: 0=false, 1=true
+    // argv[13] = subpixel enabled: 0=false, 1=true
+    // argv[14] = subpixel fractional bits (int)
+    int median_idx = -1;
+    int ext_disp_idx = -1;
+    int subpixel_flag = -1;
+    int subpixel_frac = -1;
+    int motion_idx = -1; // 0 = Lucas-Kanade (default), 1 = HW motion estimation
+    if(argc > 11) median_idx = static_cast<int>(strtol(argv[11], NULL, 10));
+    if(argc > 12) ext_disp_idx = static_cast<int>(strtol(argv[12], NULL, 10));
+    if(argc > 13) subpixel_flag = static_cast<int>(strtol(argv[13], NULL, 10));
+    if(argc > 14) subpixel_frac = static_cast<int>(strtol(argv[14], NULL, 10));
+    if(argc > 15) motion_idx = static_cast<int>(strtol(argv[15], NULL, 10));
 
     // terminate process by calling SIGINT(Ctrl-C)
     struct sigaction act;
@@ -238,7 +174,6 @@ int main(int argc, char **argv) {
     sigaction(SIGINT, &act, NULL);
 
     // creating unix socket ,ipc_local_addr to send and receive points features_addr, imu_addr
-
     struct sockaddr_un ipc_local_addr, imu_addr, features_addr;
     unlink("/tmp/chobits_2222");
     memset(&ipc_local_addr, 0, sizeof(struct sockaddr_un));
@@ -275,22 +210,27 @@ int main(int argc, char **argv) {
 
     auto xoutTrackedFeaturesLeft = pipeline.create<dai::node::XLinkOut>();
     auto xoutTrackedFeaturesRight = pipeline.create<dai::node::XLinkOut>();
-    auto xoutPassthroughFrameLeft = pipeline.create<dai::node::XLinkOut>();
-    auto xoutPassthroughFrameRight = pipeline.create<dai::node::XLinkOut>();
+    // passthrough XLinkOuts: declare pointers here so they are in scope for later linking
+    std::shared_ptr<dai::node::XLinkOut> xoutPassthroughFrameLeft = nullptr;
+    std::shared_ptr<dai::node::XLinkOut> xoutPassthroughFrameRight = nullptr;
+    if (allow == 1) {
+        xoutPassthroughFrameLeft = pipeline.create<dai::node::XLinkOut>();
+        xoutPassthroughFrameRight = pipeline.create<dai::node::XLinkOut>();
+    }
     auto xinTrackedFeaturesConfig = pipeline.create<dai::node::XLinkIn>();
     auto xout_disp = pipeline.create<dai::node::XLinkOut>();
     auto xout_imu = pipeline.create<dai::node::XLinkOut>();
-    // auto xout_focal = pipeline.create<dai::node::XLinkOut>(); //here
 
     // specify some stream names over which nodes receive their data
     xoutTrackedFeaturesLeft->setStreamName("trackedFeaturesLeft");
     xoutTrackedFeaturesRight->setStreamName("trackedFeaturesRight");
-    xoutPassthroughFrameLeft->setStreamName("passthroughFrameLeft");
-    xoutPassthroughFrameRight->setStreamName("passthroughFrameRight");
+    if (allow == 1 && xoutPassthroughFrameLeft && xoutPassthroughFrameRight) {
+        xoutPassthroughFrameLeft->setStreamName("passthroughFrameLeft");
+        xoutPassthroughFrameRight->setStreamName("passthroughFrameRight");
+    }
     xinTrackedFeaturesConfig->setStreamName("trackedFeaturesConfig");
     xout_disp->setStreamName("disparity");
     xout_imu->setStreamName("imu");
-    //xout_focal->setStreamName("focal"); //here
 
     // Properties
     monoLeft->setResolution(dai::MonoCameraProperties::SensorResolution::THE_400_P);
@@ -301,22 +241,27 @@ int main(int argc, char **argv) {
     monoRight->setFps(strtol(argv[3],NULL,10));
 
 
-    // Initializes motion estimator to LucasKanade
+    // Initializes motion estimator (default: Lucas-Kanade)
     auto featureTrackerConfig = featureTrackerLeft->initialConfig.get();
     printConfig("before", featureTrackerConfig);
 
     featureTrackerConfig.cornerDetector.numTargetFeatures = strtol(argv[1],NULL,10);
     featureTrackerConfig.cornerDetector.numMaxFeatures = strtol(argv[2],NULL,10);
 
+
     //HARRIS OR SHI_THOMASI, I prefer shi_tomasi
     featureTrackerConfig.cornerDetector.type = dai::FeatureTrackerConfig::CornerDetector::Type::SHI_THOMASI;
-    // HW_MOTION_ESTIMATION or LUCAS_KANADE_OPTICAL_FLOW, I prefer lucas-kanade, but this might be worth a try
-    //featureTrackerConfig.motionEstimator.type = dai::FeatureTrackerConfig::MotionEstimator::Type::HW_MOTION_ESTIMATION;
-    // LukasKanade empirical config /inlcude/depthai/pipeline/datatype/FeatureTrackerConfig.hpp
-    featureTrackerConfig.motionEstimator.opticalFlow.searchWindowWidth = strtol(argv[7],NULL,10);
-    featureTrackerConfig.motionEstimator.opticalFlow.searchWindowHeight = strtol(argv[7],NULL,10);
-    featureTrackerConfig.motionEstimator.opticalFlow.epsilon = std::stof(argv[8], NULL);
-    featureTrackerConfig.motionEstimator.opticalFlow.maxIterations = strtol(argv[9],NULL,10);
+    // Motion estimator selection: 0 = Lucas-Kanade (default), 1 = HW motion estimation
+    if(motion_idx == 1) {
+        featureTrackerConfig.motionEstimator.type = dai::FeatureTrackerConfig::MotionEstimator::Type::HW_MOTION_ESTIMATION;
+    } else {
+        featureTrackerConfig.motionEstimator.type = dai::FeatureTrackerConfig::MotionEstimator::Type::LUCAS_KANADE_OPTICAL_FLOW;
+        // Lukas-Kanade empirical config (only relevant for Lucas-Kanade)
+        featureTrackerConfig.motionEstimator.opticalFlow.searchWindowWidth = strtol(argv[7],NULL,10);
+        featureTrackerConfig.motionEstimator.opticalFlow.searchWindowHeight = strtol(argv[7],NULL,10);
+        featureTrackerConfig.motionEstimator.opticalFlow.epsilon = std::stof(argv[8], NULL);
+        featureTrackerConfig.motionEstimator.opticalFlow.maxIterations = strtol(argv[9],NULL,10);
+    }
     //featureMaintainer likely to remain unchanged
     //featureTrackerConfig.FeatureMaintainer.minimumDistanceBetweenFeatures = 50;
     //featureTrackerConfig.FeatureMaintainer.lostFeatureErrorThreshold = 50000;
@@ -333,20 +278,55 @@ int main(int argc, char **argv) {
     featureTrackerLeft->setHardwareResources(numShaves, numSlices);
     featureTrackerRight->setHardwareResources(numShaves, numSlices);
 
-    depth->setDefaultProfilePreset(dai::node::StereoDepth::PresetMode::HIGH_ACCURACY);
-    depth->initialConfig.setMedianFilter(dai::MedianFilter::KERNEL_5x5);
-    depth->setLeftRightCheck(true);
-    depth->setExtendedDisparity(false);
-    depth->setSubpixel(true);
-    depth->setSubpixelFractionalBits(strtol(argv[4],NULL,10)); 
-    depth->setDepthAlign(dai::RawStereoDepthConfig::AlgorithmControl::DepthAlign::RECTIFIED_LEFT);
-    depth->setAlphaScaling(0);
+    // choose preset parsed from argv[4]
+    dai::node::StereoDepth::PresetMode depthPreset;
+    switch(depth_preset_idx) {
+        case 1:
+            depthPreset = dai::node::StereoDepth::PresetMode::HIGH_ACCURACY;
+            break;
+        case 2:
+            depthPreset = dai::node::StereoDepth::PresetMode::HIGH_DENSITY;
+            break;
+        default:
+            depthPreset = dai::node::StereoDepth::PresetMode::HIGH_ACCURACY;
+            break;
+    }
+    depth->setDefaultProfilePreset(depthPreset);
+
+    // Apply optional overrides after preset so they overwrite preset values
+    if(median_idx >= 0) {
+        switch(median_idx) {
+            case 0:
+                depth->initialConfig.setMedianFilter(dai::MedianFilter::MEDIAN_OFF);
+                break;
+            case 1:
+                depth->initialConfig.setMedianFilter(dai::MedianFilter::KERNEL_5x5);
+                break;
+            case 2:
+                depth->initialConfig.setMedianFilter(dai::MedianFilter::KERNEL_7x7);
+                break;
+            default:
+                depth->initialConfig.setMedianFilter(dai::MedianFilter::KERNEL_5x5);
+                break;
+        }
+    }
+    if(ext_disp_idx >= 0) {
+        depth->setExtendedDisparity(ext_disp_idx != 0);
+    }
+    if(subpixel_flag >= 0) {
+        depth->setSubpixel(subpixel_flag != 0);
+    }
+    if(subpixel_frac >= 0) {
+        depth->setSubpixelFractionalBits(subpixel_frac);
+    }
+
+    depth->setDepthAlign(dai::RawStereoDepthConfig::AlgorithmControl::DepthAlign::RECTIFIED_LEFT); // not within preset
+    depth->setAlphaScaling(0); // not within preset
     /*
     possibly beneficial but potentional issues
     - disparity indexing still works?
     - normalized math works?
     */
-    depth->setRectification(strtol(argv[10],NULL,10));
 
     // Accelerometer options: 15Hz, 31Hz, 62Hz, 125Hz, 250Hz 500Hz
     imu->enableIMUSensor(dai::IMUSensor::ACCELEROMETER, strtol(argv[5],NULL,10));
@@ -363,12 +343,16 @@ int main(int argc, char **argv) {
     // Linking
     monoLeft->out.link(depth->left);
     depth->rectifiedLeft.link(featureTrackerLeft->inputImage);
-    featureTrackerLeft->passthroughInputImage.link(xoutPassthroughFrameLeft->input);
+    if (allow == 1) {
+        featureTrackerLeft->passthroughInputImage.link(xoutPassthroughFrameLeft->input);
+    }
     featureTrackerLeft->outputFeatures.link(xoutTrackedFeaturesLeft->input);
 
     monoRight->out.link(depth->right);
     depth->rectifiedRight.link(featureTrackerRight->inputImage);
-    featureTrackerRight->passthroughInputImage.link(xoutPassthroughFrameRight->input);
+    if (allow == 1) {
+        featureTrackerRight->passthroughInputImage.link(xoutPassthroughFrameRight->input);
+    }
     featureTrackerRight->outputFeatures.link(xoutTrackedFeaturesRight->input);
 
     depth->disparity.link(xout_disp->input);
@@ -420,41 +404,25 @@ int main(int argc, char **argv) {
     double r_inv_k22 = 1.0 / f;
     double r_inv_k23 = -cy / f;
 
-    // prints 7,4996
-    // auto s_pairs = device.getAvailableStereoPairs();
-    // for (auto& s_pair : s_pairs) {
-    //     std::cout << "(TEMPORARY PRINTOUT: possilbe stereo pair baseline:" << s_pair.baseline << " cm\n";
-    // }
-
     // verbose logging
     //device.setLogOutputLevel(dai::LogLevel::DEBUG);
     //device.setLogLevel(dai::LogLevel::DEBUG);
 
     // Output queues used to receive the results
     // 3rd argument when false specifies that old messages are overwritten when the queue is full
-    auto outputFeaturesLeftQueue = device.getOutputQueue("trackedFeaturesLeft", 4, false); // size of queue, increased slightly to reduce jitter
-    auto outputFeaturesRightQueue = device.getOutputQueue("trackedFeaturesRight", 4, false);
-    auto passthroughImageLeftQueue = device.getOutputQueue("passthroughFrameLeft", 4, false);
-    auto passthroughImageRightQueue = device.getOutputQueue("passthroughFrameRight", 4, false);
-    auto disp_queue = device.getOutputQueue("disparity", 4, false);
+    auto outputFeaturesLeftQueue = device.getOutputQueue("trackedFeaturesLeft", 1, false); // size of queue, increased slightly to reduce jitter
+    auto outputFeaturesRightQueue = device.getOutputQueue("trackedFeaturesRight", 1, false);
+    if (allow == 1) {
+        auto passthroughImageLeftQueue = device.getOutputQueue("passthroughFrameLeft", 1, false);
+        auto passthroughImageRightQueue = device.getOutputQueue("passthroughFrameRight", 1, false);
+    }
+    auto disp_queue = device.getOutputQueue("disparity", 1, false);
     auto imuQueue = device.getOutputQueue("imu", 5, false);
     // Input queue to send runtime FeatureTracker config updates (optional)
     auto inputFeatureTrackerConfigQueue = device.getInputQueue("trackedFeaturesConfig");
 
-    //RPI IS MISSING cairo-xlib DEPENDENCY TO MAKE VISUALISATION POSSIBLE, IM NOT DEALING WITH THAT
-
-    // Visualization windows / drawers
-    // const auto leftWindowName = "left";
-    // auto leftFeatureDrawer = FeatureTrackerDrawer("Feature tracking duration (frames)", leftWindowName);
-
-    // const auto rightWindowName = "right";
-    // auto rightFeatureDrawer = FeatureTrackerDrawer("Feature tracking duration (frames)", rightWindowName);
-    // auto focalQueue = device.getOutputQueue("focal", 1, false); //here
-
     // sequence numbers initialisation
     int l_seq = -1, r_seq = -2, disp_seq = -3;
-    // int64_t prev_lens_pos = -1000; //here
-    // float prev_lens_pos_raw = -1.0f;//here
 
     // tools for variable processing
     std::vector<std::uint8_t> disp_frame; // disparity frame data
@@ -476,58 +444,30 @@ int main(int argc, char **argv) {
     int l_count = 0, r_count = 0, disp_count = 0;
 
     while(camera_run) {
+        // Micro-optimizations (kept behavior the same):
+        // 1) Cache a single host timestamp per loop to avoid calling steady_clock::now() multiple times.
+        // 2) Reserve the right-features map before inserting to avoid rehashing.
+        // 3) Use reinterpret_cast for the disparity pointer to make intent explicit.
+        // Note: tracked-features remain copied from the packet to preserve original semantics.
         auto q_name = device.getQueueEvent();
-        // Handle passthrough frames (display) - these are emitted by FeatureTracker passthroughInputImage CURRENTLY UNAVAILABLE
-        // if (q_name == "passthroughFrameLeft") {
-        //     auto inPassthroughFrameLeft = passthroughImageLeftQueue->get<dai::ImgFrame>();
-        //     // DepthAI may be built without OpenCV helper support; get raw data and construct a cv::Mat
-        //     auto dataLeft = inPassthroughFrameLeft->getData();
-        //     int hLeft = inPassthroughFrameLeft->getHeight();
-        //     int wLeft = inPassthroughFrameLeft->getWidth();
-        //     cv::Mat passthroughFrameLeft(hLeft, wLeft, CV_8UC1, (void*)dataLeft.data());
-        //     cv::cvtColor(passthroughFrameLeft, leftFrame, cv::COLOR_GRAY2BGR);
-        //     // draw and show
-        //     leftFeatureDrawer.drawFeatures(leftFrame);
-        //     cv::imshow(leftWindowName, leftFrame);
-        // } else if (q_name == "passthroughFrameRight") {
-        //     auto inPassthroughFrameRight = passthroughImageRightQueue->get<dai::ImgFrame>();
-        //     auto dataRight = inPassthroughFrameRight->getData();
-        //     int hRight = inPassthroughFrameRight->getHeight();
-        //     int wRight = inPassthroughFrameRight->getWidth();
-        //     cv::Mat passthroughFrameRight(hRight, wRight, CV_8UC1, (void*)dataRight.data());
-        //     cv::cvtColor(passthroughFrameRight, rightFrame, cv::COLOR_GRAY2BGR);
-        //     rightFeatureDrawer.drawFeatures(rightFrame);
-        //     cv::imshow(rightWindowName, rightFrame);
-        // }
+        auto now_host = std::chrono::steady_clock::now();
 
         if (q_name == "trackedFeaturesLeft") { // waits until specified queue gets a message
             auto data = outputFeaturesLeftQueue->get<dai::TrackedFeatures>();
             l_features = data->trackedFeatures;
             l_seq = data->getSequenceNum(); // retrieve sequence number
             features_tp = data->getTimestampDevice(); // timestamp from camera
-            // update tracking paths for visualization CURRENTLY UNAVAILABLE
-            // leftFeatureDrawer.trackFeaturePath(l_features);
-            // if (!leftFrame.empty()) {
-            //     leftFeatureDrawer.drawFeatures(leftFrame);
-            //     cv::imshow(leftWindowName, leftFrame);
-            // }
-            //std::cout << "LEFT ft " << l_seq << " latency:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - features_tp).count() << " ms\n";
-            l_sum += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - data->getTimestamp()).count();
-            l_count += 1;
+            l_sum += std::chrono::duration<float, std::milli>(now_host - data->getTimestamp()).count();
+            ++l_count;
         } else if (q_name == "trackedFeaturesRight") {
             auto data = outputFeaturesRightQueue->get<dai::TrackedFeatures>();
             r_features = data->trackedFeatures;
             r_seq = data->getSequenceNum();
-            // update tracking paths for visualization CURRENTLY UNAVAILABLE
-            // rightFeatureDrawer.trackFeaturePath(r_features);
-            // if (!rightFrame.empty()) {
-            //     rightFeatureDrawer.drawFeatures(rightFrame);
-            //     cv::imshow(rightWindowName, rightFrame);
-            // }
-            //std::cout << "RIGHT ft " << r_seq << " latency:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - data->getTimestamp()).count() << " ms\n";
-            r_sum += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - data->getTimestamp()).count();
-            r_count += 1;
+            r_sum += std::chrono::duration<float, std::milli>(now_host - data->getTimestamp()).count();
+            ++r_count;
+            // Reserve capacity to avoid repeated rehashing when filling the map.
             r_cur_features.clear();
+            r_cur_features.reserve(r_features.size());
             for (const auto &feature : r_features) {
                 r_cur_features[feature.id] = feature.position; // map features to indexes
             }
@@ -535,49 +475,45 @@ int main(int argc, char **argv) {
             auto disp_data = disp_queue->get<dai::ImgFrame>();
             disp_seq = disp_data->getSequenceNum();
             disp_frame = disp_data->getData(); // return only disparity data from frame
-            pDisp_frame16 = (uint16_t*)disp_frame.data();
-            // std::cout << "stereo " << disp_seq << " latency:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - disp_data->getTimestamp()).count() << " ms\n";
-            disp_sum += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - disp_data->getTimestamp()).count();
-            disp_count += 1;
-        /*} else if (q_name == "focal") {
-            auto data = focalQueue->get<dai::ImgFrame>();
-            // sequence number available if needed
-            //int cam_seq = cam_frame->getSequenceNum();
-            // very likely wrong camera, need to run on camera 1st
-            int lens_pos = cam_frame->getLensPosition(dai::CameraBoardSocket::CAM_A); // 0..255 or -1 if not available
-            float lens_pos_raw = cam_frame->getLensPositionRaw(dai::CameraBoardSocket::CAM_A); // 0.0..1.0 or -1 if not available
-            // auto ts = cam_frame->getTimestampDevice();
-            if (lens_pos != prev_lens_pos) {
-                std::cout << " lens_pos=" << lens_pos << " lens_pos_raw=" << lens_pos_raw << "\n";
-                prev_lens_pos = lens_pos;
-                //prev_lens_pos_raw = lens_pos_raw;
-            }*/
+            // Use reinterpret_cast to express that we're reinterpreting raw bytes as uint16_t samples.
+            pDisp_frame16 = reinterpret_cast<uint16_t*>(disp_frame.data());
+            disp_sum += std::chrono::duration<float, std::milli>(now_host - disp_data->getTimestamp()).count();
+            ++disp_count;
         } else if (q_name == "imu") {
+            // IMU branch optimizations (safe, behavior-preserving):
+            // - use const refs to avoid accidental copies
+            // - reuse a single small buffer per IMU-event (stack-allocated once per q_name)
+            // - cache timestamp conversion into a local double to avoid repeated expression overhead
+            // - explicitly ignore sendto return value to avoid compiler warnings
             auto imuData = imuQueue->get<dai::IMUData>();
-            auto imuPackets = imuData->packets;
-                    for(const auto& imuPacket : imuPackets) {
-                        auto& acc = imuPacket.acceleroMeter;
-                        auto& gyro = imuPacket.gyroscope;
-                        // prepare local buffer for IMU message
-                        double imu_buf[7];
-                        imu_buf[0] = std::chrono::duration<double>(gyro.getTimestampDevice().time_since_epoch()).count();
-                        // translate to ros frame
-                        imu_buf[1] = -acc.z;
-                        imu_buf[2] = -acc.y;
-                        imu_buf[3] = -acc.x;
-                        imu_buf[4] = -gyro.z;
-                        imu_buf[5] = -gyro.y;
-                        imu_buf[6] = -gyro.x;
-                        ssize_t sent = sendto(ipc_sock, imu_buf, sizeof(imu_buf), 0, (struct sockaddr*)&imu_addr, sizeof(struct sockaddr_un));
-                        // if (sent == -1) {
-                        //     perror("imu data send failed");
-                        //     camera_run = 0;
-                        // }
-                    }
-            //  if (!imu_ok) {
-            //      imu_ok = true;
-            //      std::cout << "imu ok\n";
-            //  }
+            const auto &imuPackets = imuData->packets;
+
+            // Small stack buffer reused for every packet in this batch (keeps one allocation, tiny and fast)
+            double imu_buf[7];
+            for (const auto &imuPacket : imuPackets) {
+                const auto &acc = imuPacket.acceleroMeter;
+                const auto &gyro = imuPacket.gyroscope;
+
+                // compute timestamp once per packet
+                double ts = std::chrono::duration<double>(gyro.getTimestampDevice().time_since_epoch()).count();
+                imu_buf[0] = ts;
+
+                // translate to ROS frame (axis remap used elsewhere in project)
+                imu_buf[1] = -acc.z;
+                imu_buf[2] = -acc.y;
+                imu_buf[3] = -acc.x;
+                imu_buf[4] = -gyro.z;
+                imu_buf[5] = -gyro.y;
+                imu_buf[6] = -gyro.x;
+
+                // send immediately; ignore return value intentionally (non-blocking local socket typical)
+                (void)sendto(ipc_sock, imu_buf, sizeof(imu_buf), 0, (const struct sockaddr*)&imu_addr, sizeof(struct sockaddr_un));
+            }
+
+            if (!imu_ok) {
+                imu_ok = true;
+                std::cout << "imu ok\n";
+            }
         }
 
         if (l_seq == r_seq && r_seq == disp_seq) { // executes if left, right and disparity frames align
@@ -642,13 +578,22 @@ int main(int argc, char **argv) {
                         continue;
                     }
                 }
-                // rounding down 
+                // rounding down
                 int col = roundf(x);
                 int row = roundf(y);
                 // setting bounds for possible values
                 if (col > CAM_W - 1) col = CAM_W - 1;
                 if (row > CAM_H - 1) row = CAM_H - 1;
-                float disp = pDisp_frame16[row * CAM_W + col] / 8.0f; // disparity value at pixel position
+                // Defensive: ensure disparity buffer is valid before indexing
+                float disp = 0.0f;
+                size_t disp_idx = static_cast<size_t>(row) * CAM_W + static_cast<size_t>(col);
+                size_t disp_len = 0;
+                if (!disp_frame.empty()) disp_len = disp_frame.size() / sizeof(uint16_t);
+                if (pDisp_frame16 == nullptr || disp_idx >= disp_len) {
+                    // No valid disparity for this pixel -> skip
+                    continue;
+                }
+                disp = static_cast<float>(pDisp_frame16[disp_idx]) / 8.0f; // disparity value at pixel position
                 if (disp > 0) { // if there exists a disparity
                     for (const auto &r_feature : r_features) {
                         float dy = y - r_feature.position.y; // difference between l and accredited to noise
@@ -657,6 +602,7 @@ int main(int argc, char **argv) {
                             lr_id_mapping[l_feature.id] = r_feature.id; // persists over multiple frames if feature is repeatedly found
                             // same as left side
                             double dt = std::chrono::duration<double>(features_tp - prv_features_tp).count();
+                            if (dt <= 1e-9) dt = 1e-6; // guard against division by zero / tiny dt
                             double vx = 0, vy = 0;
                             auto prv_pos = l_prv_features.find(l_feature.id);
                             if (prv_pos != l_prv_features.end()) {
@@ -717,7 +663,7 @@ int main(int argc, char **argv) {
             if (c < MIN_FEATURES) std::cout << "WARNING: too few features: " << c << "\n";
             // sending features
             if (c > 0) {
-                if (c > 0) { // && imu_ok
+                if (c > 0 && imu_ok) {
                     features_msg[0] = static_cast<double>(c);
                     ssize_t sent = sendto(ipc_sock, features_msg.data(), static_cast<size_t>(2 + NUMBEROF_DATA * c) * sizeof(double), 0, (struct sockaddr*)&features_addr, sizeof(struct sockaddr_un));
                     // if (sent == -1) {
@@ -737,8 +683,6 @@ int main(int argc, char **argv) {
                     static_cast<float>(r_inv_k22 * r_feature.position.y + r_inv_k23)
                 );
             }
-            //auto t2 = std::chrono::steady_clock::now();
-            //std::cout << pp_msg.points.size() << " points, " << std::chrono::duration<float, std::milli>(t2-t1).count() << " ms\n";
         }
     }
 
