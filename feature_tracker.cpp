@@ -32,10 +32,6 @@ CONFIG: jestli se CV rectification projevi jako zbytecna, bude odstranena pro ry
 
 // computer vision
 #include <opencv2/calib3d.hpp>
-// GUI / drawing
-#include <opencv2/highgui.hpp>
-#include <opencv2/imgcodecs.hpp>
-#include <opencv2/imgproc.hpp>
 
 // Includes common necessary includes for development using depthai library
 #include "depthai/depthai.hpp"
@@ -67,9 +63,6 @@ static constexpr uint16_t VFRM_VERSION = 1;
 static constexpr uint32_t VFRM_FORMAT_MONO8 = 0;
 static constexpr std::uint16_t VFRM_FLAG_LEFT = 0;
 
-// The frame-sending helper can be excluded at compile time by defining OPT.
-// Although the way this is built, specifying buildtime macros is highly unlikely
-#ifndef OPT
 static void sendVfrmMono8Unix(int sock,
                               const struct sockaddr_un& dst,
                               const cv::Mat& gray,
@@ -104,18 +97,6 @@ static void sendVfrmMono8Unix(int sock,
         (void)errno;
     }
 }
-#endif
-
-// 2D point location values
-// struct MyPoint2d {
-//     double x = 0;
-//     double y = 0;
-//     MyPoint2d() {}
-//     MyPoint2d(double px, double py) {
-//         x = px;
-//         y = py;
-//     }
-// };
 
 volatile sig_atomic_t camera_run = 1;
 void sig_func(int sig) {
@@ -126,28 +107,9 @@ void sig_func(int sig) {
 static int CAM_W = 640;
 static int CAM_H = 400;
 
-// line color
-static const auto lineColor = cv::Scalar(200, 0, 200);
-// point color
-static const auto pointColor = cv::Scalar(0, 0, 255);
-
 void calc_rect_cam_intri_extri(dai::CalibrationHandler calibData, double* f, double* cx, double* cy) {
     
     float data[9]; // left and right intrinsics
-
-    // bool uses translation information from board design data
-    // stereo baseline:7.50001stereo baseline:7.5 cm
-    //std::cout << "stereo baseline:" << calibData.getBaselineDistance(dai::CameraBoardSocket::CAM_B, dai::CameraBoardSocket::CAM_C, false);
-    //std::cout << "stereo baseline:" << calibData.getBaselineDistance(dai::CameraBoardSocket::CAM_B, dai::CameraBoardSocket::CAM_C, true) << " cm\n CAMERA TO IMU EXTRINSICS:\n";
-    
-    // to make this available, IMU calibration data would need to be available at the time of calling this function, it seems unimportant at this moment
-    /*auto imu_ext = calibData.getCameraToImuExtrinsics(dai::CameraBoardSocket::CAM_B, true);
-    for (auto& row : imu_ext) {
-        for (float val: row) {
-            std::cout << "param: " << val << "\n";
-        }
-        std::cout << "\n";
-    }*/
 
     auto l_intrinsics = calibData.getCameraIntrinsics(dai::CameraBoardSocket::CAM_B, CAM_W, CAM_H);
     int i = 0;
@@ -197,93 +159,8 @@ void printConfig(const char *time, dai::RawFeatureTrackerConfig cfg) {
     std::cout << "maintainTresholdsTrackedFeature " << cfg.featureMaintainer.trackedFeatureThreshold << "\n";
 }
 
-class FeatureTrackerDrawer {
-   private:
-    // point size in pixels
-    static const int circleRadius = 2;
-    // longest a path can get in pixels
-    static const int maxTrackedFeaturesPathLength = 30;
-    // for how many frames the feature is tracked   !!
-    static int trackedFeaturesPathLength;
-
-    // alias for id=uint32_t
-    using featureIdType = decltype(dai::TrackedFeature::id);
-
-    // container of types featureIdType as hash-based set - search, insertion and removal have constant-time complexity
-    std::unordered_set<featureIdType> trackedIDs;
-    // container of featureIdType matched to 2D coordinates stored in double opened queue container - deque
-    std::unordered_map<featureIdType, std::deque<dai::Point2f>> trackedFeaturesPath;
-    // unimportant
-    std::string trackbarName;
-    std::string windowName;
-
-   public:
-    // function that takes vector of newly tracked features, and stores them
-    void trackFeaturePath(std::vector<dai::TrackedFeature>& features) {
-        std::unordered_set<featureIdType> newTrackedIDs;
-        for(auto& currentFeature : features) {
-            auto currentID = currentFeature.id;
-            newTrackedIDs.insert(currentID);
-
-            // if trackedFeaturesPath doesnt contain feature with currentID key, empty deque is inserted 
-            //auto& path = trackedFeatures[currentID]; // can replace next 3 lines because of unordered set intrinsic duplicate prevention
-            if(!trackedFeaturesPath.count(currentID)) {
-                trackedFeaturesPath.insert({currentID, std::deque<dai::Point2f>()});
-            }
-            // takes a reference to either last feature or newly created empty deque - value at currentID
-            std::deque<dai::Point2f>& path = trackedFeaturesPath.at(currentID);
-
-            // adds x,y position to path at the end, if vector isnt big enough its automatically resized 
-            path.push_back(currentFeature.position);
-            // if size of path is greater than either one or amount set by trackedFeaturesPathLength, first element is removed
-            while(path.size() > std::max<unsigned int>(1, trackedFeaturesPathLength)) {
-                path.pop_front();
-            }
-        }
-        
-        // .count counts number of elements of that id, which can be either 1 or 0
-        // if newTrrackedIDs doesnt contain ID of a feature in already tracked set,
-        // it is then placed in featuresToRemove set - because it becomes useless
-        std::unordered_set<featureIdType> featuresToRemove;
-        for(auto& oldId : trackedIDs) {
-            if(!newTrackedIDs.count(oldId)) {
-                featuresToRemove.insert(oldId);
-            }
-        }
-        // those features are then removed from trackedFeaturesPath
-        for(auto& id : featuresToRemove) {
-            trackedFeaturesPath.erase(id);
-        }
-        // currently processed features are moved back for the next iteration
-        trackedIDs = newTrackedIDs;
-    }
-
-    // drawer skipped, requires to be sorted through for potentionally important info
-    void drawFeatures(cv::Mat& img) {
-        cv::setTrackbarPos(trackbarName.c_str(), windowName.c_str(), trackedFeaturesPathLength);
-
-        for(auto& featurePath : trackedFeaturesPath) {
-            std::deque<dai::Point2f>& path = featurePath.second;
-            unsigned int j = 0;
-            for(j = 0; j < path.size() - 1; j++) {
-                auto src = cv::Point(path[j].x, path[j].y);
-                auto dst = cv::Point(path[j + 1].x, path[j + 1].y);
-                cv::line(img, src, dst, lineColor, 1, cv::LINE_AA, 0);
-            }
-
-            cv::circle(img, cv::Point(path[j].x, path[j].y), circleRadius, pointColor, -1, cv::LINE_AA, 0);
-        }
-    }
-
-    // class constructor -- describe
-    FeatureTrackerDrawer(std::string trackbarName, std::string windowName) : trackbarName(trackbarName), windowName(windowName) {
-        cv::namedWindow(windowName.c_str());
-        cv::createTrackbar(trackbarName.c_str(), windowName.c_str(), &trackedFeaturesPathLength, maxTrackedFeaturesPathLength, nullptr);
-    }
-};
-
-// sets the amount of frames a feature is tracked across to 10
-int FeatureTrackerDrawer::trackedFeaturesPathLength = 10;
+// Note: on-host drawing helpers removed; this binary will not visualize locally but retains
+// the ability to send feature and frame data to external consumers via sockets.
 
 int main(int argc, char **argv) {
     int num_frames=0; // number of frames
@@ -298,7 +175,7 @@ int main(int argc, char **argv) {
     act.sa_handler = sig_func; // pointer to function
     sigaction(SIGINT, &act, NULL);
 
-    // creating unix socket ,ipc_local_addr to send and receive points features_addr, imu_addr
+    // creating unix socket ipc_local_addr to send and receive points features_addr, imu_addr
 
     struct sockaddr_un ipc_local_addr, imu_addr, features_addr, frames_addr;
     unlink("/tmp/chobits_2222");
@@ -352,8 +229,7 @@ int main(int argc, char **argv) {
     }
 
         // Runtime option: if an extra cmdline argument (argv[16]) is provided and equals "0",
-        // disable sending of full frames at runtime. This works together with the compile-time
-        // guard OPT: if OPT is defined, the send function and call sites are removed.
+        // disable sending of full frames at runtime
         bool opt_send_vfrm = true;
         if(argc > 16 && argv[16]) {
             if(std::string(argv[16]) == "0") opt_send_vfrm = false;
@@ -365,7 +241,6 @@ int main(int argc, char **argv) {
     // Define sources and outputs
     auto monoLeft = pipeline.create<dai::node::MonoCamera>();
     auto monoRight = pipeline.create<dai::node::MonoCamera>();
-    //auto colorCam = pipeline.create<dai::node::ColorCamera>();
     auto featureTrackerLeft = pipeline.create<dai::node::FeatureTracker>();
     auto featureTrackerRight = pipeline.create<dai::node::FeatureTracker>();
     auto imu = pipeline.create<dai::node::IMU>();
@@ -381,7 +256,6 @@ int main(int argc, char **argv) {
     auto xinTrackedFeaturesConfig = pipeline.create<dai::node::XLinkIn>();
     auto xout_disp = pipeline.create<dai::node::XLinkOut>();
     auto xout_imu = pipeline.create<dai::node::XLinkOut>();
-    // auto xout_focal = pipeline.create<dai::node::XLinkOut>(); //here
 
     // specify some stream names over which nodes receive their data
     xoutTrackedFeaturesLeft->setStreamName("trackedFeaturesLeft");
@@ -391,7 +265,6 @@ int main(int argc, char **argv) {
     xinTrackedFeaturesConfig->setStreamName("trackedFeaturesConfig");
     xout_disp->setStreamName("disparity");
     xout_imu->setStreamName("imu");
-    //xout_focal->setStreamName("focal"); //here
 
     // Properties
     // Map argv[11] (resolution selection) to DepthAI enum; default to THE_400_P
@@ -499,12 +372,7 @@ int main(int argc, char **argv) {
     // Allow runtime updates to FeatureTracker configuration for both left and right
     xinTrackedFeaturesConfig->out.link(featureTrackerLeft->inputConfig);
     xinTrackedFeaturesConfig->out.link(featureTrackerRight->inputConfig);
-    // Link color camera ISP output to focal XLinkOut so we get lens metadata
-    // colorCam->setPreviewSize(CAM_W, CAM_H);
-    // colorCam->setFps(20);
-    // Ensure 3A runs at camera framerate so AF metadata is available
-    // colorCam->setIsp3aFps(20);
-    // colorCam->isp.link(xout_focal->input); // send ISP frames from color camera to host
+
 
     // list cameras so i know which one to configure
     std::cout << "Searching for all available devices...\n\n";
@@ -543,36 +411,21 @@ int main(int argc, char **argv) {
     double r_inv_k22 = 1.0 / f;
     double r_inv_k23 = -cy / f;
 
-    // prints 7,4996
-    // auto s_pairs = device.getAvailableStereoPairs();
-    // for (auto& s_pair : s_pairs) {
-    //     std::cout << "(TEMPORARY PRINTOUT: possilbe stereo pair baseline:" << s_pair.baseline << " cm\n";
-    // }
-
     // verbose logging
     //device.setLogOutputLevel(dai::LogLevel::DEBUG);
     //device.setLogLevel(dai::LogLevel::DEBUG);
 
     // Output queues used to receive the results
     // 3rd argument when false specifies that old messages are overwritten when the queue is full
-    auto outputFeaturesLeftQueue = device.getOutputQueue("trackedFeaturesLeft", 8, false); // size of queue, increased slightly to reduce jitter
-    auto outputFeaturesRightQueue = device.getOutputQueue("trackedFeaturesRight", 8, false);
-    auto passthroughImageLeftQueue = device.getOutputQueue("passthroughFrameLeft", 8, false);
-    auto passthroughImageRightQueue = device.getOutputQueue("passthroughFrameRight", 8, false);
-    auto disp_queue = device.getOutputQueue("disparity", 8, false);
-    auto imuQueue = device.getOutputQueue("imu", 8, false);
+    // increase output queue sizes to reduce overwrites at higher frame rates
+    auto outputFeaturesLeftQueue = device.getOutputQueue("trackedFeaturesLeft", 16, false);
+    auto outputFeaturesRightQueue = device.getOutputQueue("trackedFeaturesRight", 16, false);
+    auto passthroughImageLeftQueue = device.getOutputQueue("passthroughFrameLeft", 16, false);
+    auto passthroughImageRightQueue = device.getOutputQueue("passthroughFrameRight", 16, false);
+    auto disp_queue = device.getOutputQueue("disparity", 16, false);
+    auto imuQueue = device.getOutputQueue("imu", 16, false);
     // Input queue to send runtime FeatureTracker config updates (optional)
     auto inputFeatureTrackerConfigQueue = device.getInputQueue("trackedFeaturesConfig");
-
-    //RPI IS MISSING cairo-xlib DEPENDENCY TO MAKE VISUALISATION POSSIBLE, IM NOT DEALING WITH THAT
-
-    // Visualization windows / drawers
-    // const auto leftWindowName = "left";
-    // auto leftFeatureDrawer = FeatureTrackerDrawer("Feature tracking duration (frames)", leftWindowName);
-
-    // const auto rightWindowName = "right";
-    // auto rightFeatureDrawer = FeatureTrackerDrawer("Feature tracking duration (frames)", rightWindowName);
-    // auto focalQueue = device.getOutputQueue("focal", 1, false); //here
 
     // sequence numbers initialisation
     int l_seq = -1, r_seq = -2, disp_seq = -3;
@@ -600,6 +453,11 @@ int main(int argc, char **argv) {
     // passthrough (raw frames) latency sums and counts (analogous to tracked features)
     float pt_l_sum = 0.0f, pt_r_sum = 0.0f;
     int pt_l_count = 0, pt_r_count = 0;
+    // per-second diagnostic counters
+    int64_t msgs_features_left = 0, msgs_features_right = 0;
+    int64_t msgs_disp = 0, msgs_pt_left = 0, msgs_pt_right = 0, msgs_imu = 0;
+    int64_t syncs_processed = 0;
+    auto diag_last_tp = std::chrono::steady_clock::now();
 
     while(camera_run) {
         auto q_name = device.getQueueEvent();
@@ -609,7 +467,7 @@ int main(int argc, char **argv) {
             // record passthrough LEFT frame latency (analogous to tracked features latency accounting)
             pt_l_sum += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - inPassthroughFrameLeft->getTimestamp()).count();
             pt_l_count += 1;
-#ifndef OPT
+            msgs_pt_left++;
             if(opt_send_vfrm) {
                 // send LEFT mono8 raw frame over unix socket as VFRM (best-effort)
                 auto dataLeft = inPassthroughFrameLeft->getData();
@@ -619,7 +477,6 @@ int main(int argc, char **argv) {
                 double ts = std::chrono::duration<double>(inPassthroughFrameLeft->getTimestampDevice().time_since_epoch()).count();
                 sendVfrmMono8Unix(ipc_sock, frames_addr, frameLeft, ts, VFRM_FLAG_LEFT);
             }
-#endif
             continue;
         } else if (q_name == "passthroughFrameRight") {
             // consume right passthrough frame but do not send it (not required by consumer)
@@ -628,6 +485,7 @@ int main(int argc, char **argv) {
             // record passthrough RIGHT frame latency (analogous to tracked features latency accounting)
             pt_r_sum += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - inPassthroughFrameRight->getTimestamp()).count();
             pt_r_count += 1;
+            msgs_pt_right++;
             continue;
         }
 
@@ -637,29 +495,17 @@ int main(int argc, char **argv) {
             l_features = std::move(data->trackedFeatures);
             l_seq = data->getSequenceNum(); // retrieve sequence number
             features_tp = data->getTimestampDevice(); // timestamp from camera
-            // update tracking paths for visualization CURRENTLY UNAVAILABLE
-            // leftFeatureDrawer.trackFeaturePath(l_features);
-            // if (!leftFrame.empty()) {
-            //     leftFeatureDrawer.drawFeatures(leftFrame);
-            //     cv::imshow(leftWindowName, leftFrame);
-            // }
-            //std::cout << "LEFT ft " << l_seq << " latency:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - features_tp).count() << " ms\n";
             l_sum += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - data->getTimestamp()).count();
             l_count += 1;
+            msgs_features_left++;
         } else if (q_name == "trackedFeaturesRight") {
             auto data = outputFeaturesRightQueue->get<dai::TrackedFeatures>();
             // move vector contents from the message to avoid element-wise copy
             r_features = std::move(data->trackedFeatures);
             r_seq = data->getSequenceNum();
-            // update tracking paths for visualization CURRENTLY UNAVAILABLE
-            // rightFeatureDrawer.trackFeaturePath(r_features);
-            // if (!rightFrame.empty()) {
-            //     rightFeatureDrawer.drawFeatures(rightFrame);
-            //     cv::imshow(rightWindowName, rightFrame);
-            // }
-            //std::cout << "RIGHT ft " << r_seq << " latency:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - data->getTimestamp()).count() << " ms\n";
             r_sum += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - data->getTimestamp()).count();
             r_count += 1;
+            msgs_features_right++;
             r_cur_features.clear();
             for (const auto &feature : r_features) {
                 r_cur_features[feature.id] = feature.position; // map features to indexes
@@ -673,19 +519,7 @@ int main(int argc, char **argv) {
             // std::cout << "stereo " << disp_seq << " latency:" << std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - disp_data->getTimestamp()).count() << " ms\n";
             disp_sum += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - disp_data->getTimestamp()).count();
             disp_count += 1;
-        /*} else if (q_name == "focal") {
-            auto data = focalQueue->get<dai::ImgFrame>();
-            // sequence number available if needed
-            //int cam_seq = cam_frame->getSequenceNum();
-            // very likely wrong camera, need to run on camera 1st
-            int lens_pos = cam_frame->getLensPosition(dai::CameraBoardSocket::CAM_A); // 0..255 or -1 if not available
-            float lens_pos_raw = cam_frame->getLensPositionRaw(dai::CameraBoardSocket::CAM_A); // 0.0..1.0 or -1 if not available
-            // auto ts = cam_frame->getTimestampDevice();
-            if (lens_pos != prev_lens_pos) {
-                std::cout << " lens_pos=" << lens_pos << " lens_pos_raw=" << lens_pos_raw << "\n";
-                prev_lens_pos = lens_pos;
-                //prev_lens_pos_raw = lens_pos_raw;
-            }*/
+            msgs_disp++;
         } else if (q_name == "imu") {
             auto imuData = imuQueue->get<dai::IMUData>();
             auto imuPackets = imuData->packets;
@@ -703,15 +537,12 @@ int main(int argc, char **argv) {
                         imu_buf[5] = -gyro.y;
                         imu_buf[6] = -gyro.x;
                         ssize_t sent = sendto(ipc_sock, imu_buf, sizeof(imu_buf), 0, (struct sockaddr*)&imu_addr, sizeof(struct sockaddr_un));
-                        // if (sent == -1) {
-                        //     perror("imu data send failed");
-                        //     camera_run = 0;
-                        // }
                     }
         }
 
         if (l_seq == r_seq && r_seq == disp_seq) { // executes if left, right and disparity frames align
             //auto t1 = std::chrono::steady_clock::now();
+            syncs_processed++;
             l_seq = -1;
             r_seq = -2;
             disp_seq = -3;
@@ -889,6 +720,19 @@ int main(int argc, char **argv) {
                 features_msg[0] = static_cast<double>(c);
                 ssize_t sent2 = sendto(inet_sock, features_msg.data(), featurePayloadBytes, 0, (struct sockaddr*)&inet_addr_remote, sizeof(inet_addr_remote));
                 (void)sent2; // ignore for now
+            }
+
+            // per-second diagnostics: print packet rates and syncs processed
+            {
+                auto now = std::chrono::steady_clock::now();
+                if(std::chrono::duration_cast<std::chrono::seconds>(now - diag_last_tp).count() >= 1) {
+                    std::cout << "[DIAG] features_L=" << msgs_features_left << " features_R=" << msgs_features_right
+                            << " disp=" << msgs_disp << " pt_L=" << msgs_pt_left << " pt_R=" << msgs_pt_right
+                            << " imu=" << msgs_imu << " syncs=" << syncs_processed << "\n";
+                    msgs_features_left = msgs_features_right = msgs_disp = msgs_pt_left = msgs_pt_right = msgs_imu = 0;
+                    syncs_processed = 0;
+                    diag_last_tp = now;
+                }
             }
         }
     }
