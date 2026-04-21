@@ -1,5 +1,5 @@
 /*
-odstranit potencialni deleni nulou (rychlosti)
+je /dt deleni ever hazard? (aktualne si to nemyslim, dovoluji si tedy lenost)
 je pDisp_frame16 safe? k zamysleni
 not rly sure about the framerate na featurach, na to se asi jeste blize podivam jestli je moje logika spravna
 extended disparity neni implementovana a mozna by nekdo moh kdyby chtel
@@ -597,12 +597,18 @@ int main(int argc, char **argv) {
 
     float l_sum = 0.0, r_sum = 0.0, disp_sum = 0.0;
     int l_count = 0, r_count = 0, disp_count = 0;
+    // passthrough (raw frames) latency sums and counts (analogous to tracked features)
+    float pt_l_sum = 0.0f, pt_r_sum = 0.0f;
+    int pt_l_count = 0, pt_r_count = 0;
 
     while(camera_run) {
         auto q_name = device.getQueueEvent();
         if (q_name == "passthroughFrameLeft") {
             auto inPassthroughFrameLeft = passthroughImageLeftQueue->get<dai::ImgFrame>();
             (void)inPassthroughFrameLeft; // stop compiler warning about unused variable
+            // record passthrough LEFT frame latency (analogous to tracked features latency accounting)
+            pt_l_sum += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - inPassthroughFrameLeft->getTimestamp()).count();
+            pt_l_count += 1;
 #ifndef OPT
             if(opt_send_vfrm) {
                 // send LEFT mono8 raw frame over unix socket as VFRM (best-effort)
@@ -619,6 +625,9 @@ int main(int argc, char **argv) {
             // consume right passthrough frame but do not send it (not required by consumer)
             auto inPassthroughFrameRight = passthroughImageRightQueue->get<dai::ImgFrame>();
             (void)inPassthroughFrameRight;
+            // record passthrough RIGHT frame latency (analogous to tracked features latency accounting)
+            pt_r_sum += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - inPassthroughFrameRight->getTimestamp()).count();
+            pt_r_count += 1;
             continue;
         }
 
@@ -825,15 +834,31 @@ int main(int argc, char **argv) {
             if (num_frames > 60) {
                 num_frames = 0;
                 std::cout << c << " features\n";
-                std::cout << "average latency LEFT: " << l_sum/l_count << " ms\n";
-                std::cout << "average latency RIGHT: " << r_sum/r_count << " ms\n";
-                std::cout << "average latency DISPARITY: " << disp_sum/disp_count << " ms\n";
+                if(l_count > 0) std::cout << "average latency LEFT: " << l_sum/l_count << " ms\n";
+                else std::cout << "average latency LEFT: N/A (0 samples)\n";
+
+                if(r_count > 0) std::cout << "average latency RIGHT: " << r_sum/r_count << " ms\n";
+                else std::cout << "average latency RIGHT: N/A (0 samples)\n";
+
+                if(disp_count > 0) std::cout << "average latency DISPARITY: " << disp_sum/disp_count << " ms\n";
+                else std::cout << "average latency DISPARITY: N/A (0 samples)\n";
+
+                if(pt_l_count > 0) std::cout << "average latency PASSTHROUGH LEFT: " << pt_l_sum/pt_l_count << " ms\n";
+                else std::cout << "average latency PASSTHROUGH LEFT: N/A (0 samples)\n";
+
+                if(pt_r_count > 0) std::cout << "average latency PASSTHROUGH RIGHT: " << pt_r_sum/pt_r_count << " ms\n";
+                else std::cout << "average latency PASSTHROUGH RIGHT: N/A (0 samples)\n";
+
                 l_sum = 0.0;
                 r_sum = 0.0;
                 disp_sum = 0.0;
+                pt_l_sum = 0.0f;
+                pt_r_sum = 0.0f;
                 l_count = 0;
                 r_count = 0;
                 disp_count = 0;
+                pt_l_count = 0;
+                pt_r_count = 0;
             }
             if (c < MIN_FEATURES) std::cout << "WARNING: too few features: " << c << "\n";
             // sending features
