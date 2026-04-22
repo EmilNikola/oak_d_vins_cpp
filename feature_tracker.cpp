@@ -2,13 +2,8 @@
 odstranit potencialni deleni nulou (rychlosti)
 je pDisp_frame16 safe? k zamysleni
 
-NUTNOST KAMERY:
-CONFIG: jestli se CV rectification projevi jako zbytecna, bude odstranena pro rychlejsi loop - nahrazeni setRectification(True)
+3a algoritmy*
 
-COLOR CAMERA:   IMX378  4056x3040   85@2024x1520
-MONO CAMERA:    OV9282  1280x800    THE_400_P: 255@640x400  THE_720_P: 143@1280x720 THE_800_P 129@1280x800  anti-banding mode*  3a algoritmy*
-
-latency with LR and subpixel according to documentation: 800P: 30.5ms 400P: 10.1ms
 */
 
 #include <iostream>
@@ -16,8 +11,6 @@ latency with LR and subpixel according to documentation: 800P: 30.5ms 400P: 10.1
 #include <vector>
 #include <cstdint>
 #include <cstdlib>
-#include <string>
-
 #include <math.h>
 #include <stdio.h>
 #include <sys/types.h> // data types for working with processes
@@ -27,40 +20,47 @@ latency with LR and subpixel according to documentation: 800P: 30.5ms 400P: 10.1
 #include <string>
 #include <sys/un.h> // unix sockets
 #include <signal.h> // signal handling
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <errno.h>
 
 // computer vision
 #include <opencv2/calib3d.hpp>
-// GUI / drawing
-#include <opencv2/highgui.hpp>
-#include <opencv2/imgproc.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <memory>
+// threading / IPC helpers (removed - sender thread disabled)
 
 // Includes common necessary includes for development using depthai library
 #include "depthai/depthai.hpp"
-#include "deque"
-#include "unordered_map"
+#include <unordered_map>
 
-// camera parameters as specified by THE_400_P
-#define CAM_W 640
-#define CAM_H 400
 #define PAIR_DIST_SQ 9 // threshold macro
 #define MIN_FEATURES 10
-#define TARGET_FEATURES 80 // 320 is the default from source
 #define MAXIMUM_FEATURES 118
-#define FPS 20
-#define FRAC_BITS_N 3
 #define NUMBEROF_DATA 13
 
-// 2D point location values
-// struct MyPoint2d {
-//     double x = 0;
-//     double y = 0;
-//     MyPoint2d() {}
-//     MyPoint2d(double px, double py) {
-//         x = px;
-//         y = py;
-//     }
-// };
+// camera parameters as specified by THE_400_P
+static int CAM_W = 640;
+static int CAM_H = 400;
+
+
+static constexpr const char* FRAME_MAGIC = "VFRM";
+static constexpr std::uint8_t FRAME_SIDE_LEFT = 0;
+static constexpr std::uint8_t FRAME_SIDE_RIGHT = 1;
+
+static void sendFramePacket(int inet_sock, const struct sockaddr_in& inet_addr_remote, const cv::Mat& gray, std::uint8_t side) {
+    std::vector<std::uint8_t> jpg;
+    cv::imencode(".jpg", gray, jpg, {cv::IMWRITE_JPEG_QUALITY, 60});
+    if(jpg.empty()) return;
+
+    std::vector<std::uint8_t> pkt(5 + jpg.size());
+    std::memcpy(pkt.data(), FRAME_MAGIC, 4);
+    pkt[4] = side;
+    std::memcpy(pkt.data() + 5, jpg.data(), jpg.size());
+
+    sendto(inet_sock, pkt.data(), pkt.size(), 0, (struct sockaddr*)&inet_addr_remote, sizeof(inet_addr_remote));
+}
 
 volatile sig_atomic_t camera_run = 1;
 void sig_func(int sig) {
@@ -70,20 +70,6 @@ void sig_func(int sig) {
 void calc_rect_cam_intri_extri(dai::CalibrationHandler calibData, double* f, double* cx, double* cy) {
     
     float data[9]; // left and right intrinsics
-
-    // bool uses translation information from board design data
-    // stereo baseline:7.50001stereo baseline:7.5 cm
-    //std::cout << "stereo baseline:" << calibData.getBaselineDistance(dai::CameraBoardSocket::CAM_B, dai::CameraBoardSocket::CAM_C, false);
-    //std::cout << "stereo baseline:" << calibData.getBaselineDistance(dai::CameraBoardSocket::CAM_B, dai::CameraBoardSocket::CAM_C, true) << " cm\n CAMERA TO IMU EXTRINSICS:\n";
-    
-    // to make this available, IMU calibration data would need to be available at the time of calling this function, it seems unimportant at this moment
-    /*auto imu_ext = calibData.getCameraToImuExtrinsics(dai::CameraBoardSocket::CAM_B, true);
-    for (auto& row : imu_ext) {
-        for (float val: row) {
-            std::cout << "param: " << val << "\n";
-        }
-        std::cout << "\n";
-    }*/
 
     auto l_intrinsics = calibData.getCameraIntrinsics(dai::CameraBoardSocket::CAM_B, CAM_W, CAM_H);
     int i = 0;
@@ -167,6 +153,9 @@ int main(int argc, char **argv) {
     if(argc > 14) subpixel_frac = static_cast<int>(strtol(argv[14], NULL, 10));
     if(argc > 15) motion_idx = static_cast<int>(strtol(argv[15], NULL, 10));
 
+    CAM_W = static_cast<int>(strtol(argv[18], NULL, 10));
+    CAM_H = static_cast<int>(strtol(argv[19], NULL, 10));
+
     // terminate process by calling SIGINT(Ctrl-C)
     struct sigaction act;
     memset(&act, 0, sizeof(act));
@@ -188,6 +177,8 @@ int main(int argc, char **argv) {
         perror("bind failed");
         exit(EXIT_FAILURE);
     }
+
+    // NOTE: sender thread removed — sending will use direct sendto() again.
     memset(&imu_addr, 0, sizeof(struct sockaddr_un));
     imu_addr.sun_family = AF_UNIX;
     strcpy(imu_addr.sun_path, "/tmp/chobits_imu");
@@ -195,6 +186,43 @@ int main(int argc, char **argv) {
     memset(&features_addr, 0, sizeof(struct sockaddr_un));
     features_addr.sun_family = AF_UNIX;
     strcpy(features_addr.sun_path, "/tmp/chobits_features");
+
+    // Optional INET (UDP) socket to send features over network to remote visualiser ! wrong argvs, allow flags
+    bool inet_enabled = false;
+    int inet_sock = -1;
+    struct sockaddr_in inet_addr_remote;
+    // parse inet_enable flag if provided
+    int inet_flag = 0;
+    if(argc > 21) {
+        inet_flag = static_cast<int>(strtol(argv[21], NULL, 10));
+    }
+    if(inet_flag) {
+        if(argc > 23 && argv[22] && argv[23]) {
+            const char* remote_host = argv[22];
+            int remote_port = static_cast<int>(strtol(argv[23], NULL, 10));
+            inet_sock = socket(AF_INET, SOCK_DGRAM, 0);
+            if(inet_sock == -1) {
+                perror("inet socket creation failed");
+            } else {
+                // set non-blocking to avoid main-loop stalls
+                int flags = fcntl(inet_sock, F_GETFL, 0);
+                if(flags != -1) fcntl(inet_sock, F_SETFL, flags | O_NONBLOCK);
+
+                memset(&inet_addr_remote, 0, sizeof(inet_addr_remote));
+                inet_addr_remote.sin_family = AF_INET;
+                inet_addr_remote.sin_port = htons(remote_port);
+                if(inet_pton(AF_INET, remote_host, &inet_addr_remote.sin_addr) != 1) {
+                    std::cerr << "Invalid remote host IP: " << remote_host << "\n";
+                    close(inet_sock);
+                    inet_sock = -1;
+                } else {
+                    inet_enabled = true;
+                }
+            }
+        } else {
+            std::cerr << "inet_enable set but remote_host/remote_port missing (argv[22],argv[23]) - disabling inet.\n";
+        }
+    }
 
     // Create pipeline
     dai::Pipeline pipeline;
@@ -233,10 +261,19 @@ int main(int argc, char **argv) {
     xout_imu->setStreamName("imu");
 
     // Properties
-    monoLeft->setResolution(dai::MonoCameraProperties::SensorResolution::THE_400_P);
+    // Map argv[20] (resolution selection) to DepthAI enum; default to THE_400_P
+    dai::MonoCameraProperties::SensorResolution res = dai::MonoCameraProperties::SensorResolution::THE_400_P;
+    if(argc > 20 && argv[20]) {
+        std::string r(argv[20]);
+        if(r == "THE_400_P") res = dai::MonoCameraProperties::SensorResolution::THE_400_P;
+        else if(r == "THE_720_P") res = dai::MonoCameraProperties::SensorResolution::THE_720_P;
+        else if(r == "THE_800_P") res = dai::MonoCameraProperties::SensorResolution::THE_800_P;
+        // add other enum string mappings as needed
+    }
+    monoLeft->setResolution(res);
     monoLeft->setCamera("left");
     monoLeft->setFps(strtol(argv[3],NULL,10));
-    monoRight->setResolution(dai::MonoCameraProperties::SensorResolution::THE_400_P);
+    monoRight->setResolution(res);
     monoRight->setCamera("right");
     monoRight->setFps(strtol(argv[3],NULL,10));
 
@@ -273,8 +310,15 @@ int main(int argc, char **argv) {
     printConfig("after", featureTrackerConfig);
 
     // according to API refrence for both Shaves and Memory slices, maximum number is allocated
-    auto numShaves = 2;
-    auto numSlices = 2;
+    // hardware resources hint: number of shaves (VPU cores) and memory slices (CMX partitions)
+    // default values (safe): 2 shaves, 2 slices
+    int numShaves = 2;
+    int numSlices = 2;
+    // Optional argv overrides:
+    // argv[16] = numShaves (int)
+    // argv[17] = numSlices (int)
+    if(argc > 16) numShaves = static_cast<int>(strtol(argv[16], NULL, 10));
+    if(argc > 17) numSlices = static_cast<int>(strtol(argv[17], NULL, 10));
     featureTrackerLeft->setHardwareResources(numShaves, numSlices);
     featureTrackerRight->setHardwareResources(numShaves, numSlices);
 
@@ -412,9 +456,12 @@ int main(int argc, char **argv) {
     // 3rd argument when false specifies that old messages are overwritten when the queue is full
     auto outputFeaturesLeftQueue = device.getOutputQueue("trackedFeaturesLeft", 1, false); // size of queue, increased slightly to reduce jitter
     auto outputFeaturesRightQueue = device.getOutputQueue("trackedFeaturesRight", 1, false);
+    // Declare passthrough queues in outer scope so main loop can access them when `allow==1`.
+    decltype(outputFeaturesLeftQueue) passthroughImageLeftQueue = nullptr;
+    decltype(outputFeaturesRightQueue) passthroughImageRightQueue = nullptr;
     if (allow == 1) {
-        auto passthroughImageLeftQueue = device.getOutputQueue("passthroughFrameLeft", 1, false);
-        auto passthroughImageRightQueue = device.getOutputQueue("passthroughFrameRight", 1, false);
+        passthroughImageLeftQueue = device.getOutputQueue("passthroughFrameLeft", 1, false);
+        passthroughImageRightQueue = device.getOutputQueue("passthroughFrameRight", 1, false);
     }
     auto disp_queue = device.getOutputQueue("disparity", 1, false);
     auto imuQueue = device.getOutputQueue("imu", 5, false);
@@ -432,8 +479,25 @@ int main(int argc, char **argv) {
     std::unordered_map<int, dai::Point2f> r_cur_features; // right image current features indexed map
     std::chrono::time_point<std::chrono::steady_clock, std::chrono::steady_clock::duration> features_tp, prv_features_tp; // timestamps of frames
     std::unordered_map<int, int> lr_id_mapping; // features detected in left image paired to features in right
+
+    // Reserve unordered_map buckets upfront to avoid rehashing during the hot loop.
+    // Use a small safety factor to reduce rehash frequency.
+    // Allow overriding the compile-time MAXIMUM_FEATURES via argv[2] (numMaxFeatures).
+    int max_features = MAXIMUM_FEATURES;
+    if(argc > 2) max_features = static_cast<int>(strtol(argv[2], NULL, 10));
+    const size_t reserve_size = static_cast<size_t>(max_features) * 2;
+    l_prv_features.reserve(reserve_size);
+    r_prv_features.reserve(reserve_size);
+    r_cur_features.reserve(reserve_size);
+    lr_id_mapping.reserve(reserve_size);
     // Mats for visualization CURRENTLY UNAVAILABLE BECAUSE OF MISSING DEPENDENCY
     // cv::Mat leftFrame, rightFrame;
+
+    // Preallocate features message buffer once and reuse to avoid per-frame heap allocations.
+    std::vector<double> features_msg;
+    features_msg.resize(2 + NUMBEROF_DATA * max_features);
+
+    // (spatial grid removed) pairing currently uses direct scan; keep simple for now
 
     // Clear queue events
     //jakaskerl suggest remove this line
@@ -442,6 +506,10 @@ int main(int argc, char **argv) {
 
     float l_sum = 0.0, r_sum = 0.0, disp_sum = 0.0;
     int l_count = 0, r_count = 0, disp_count = 0;
+    // Timing instrumentation (ms)
+    using clock = std::chrono::steady_clock;
+    std::chrono::duration<double, std::milli> t_tracked_left{0}, t_tracked_right{0}, t_disp{0}, t_imu{0}, t_pairing{0}, t_send{0}, t_prev_update{0};
+    uint64_t cnt_tracked_left = 0, cnt_tracked_right = 0, cnt_disp = 0, cnt_imu = 0, cnt_pairing = 0, cnt_send = 0, cnt_prev_update = 0;
 
     while(camera_run) {
         // Micro-optimizations (kept behavior the same):
@@ -451,15 +519,46 @@ int main(int argc, char **argv) {
         // Note: tracked-features remain copied from the packet to preserve original semantics.
         auto q_name = device.getQueueEvent();
         auto now_host = std::chrono::steady_clock::now();
-
+        
+        // Handle passthrough frames (optional). If passthrough is enabled and we receive
+        // a passthroughFrame event, forward the JPEG over the INET socket if configured.
+        if (q_name == "passthroughFrameLeft") {
+            if(passthroughImageLeftQueue) {
+                auto inPassthroughFrameLeft = passthroughImageLeftQueue->get<dai::ImgFrame>();
+                if(inet_enabled && inet_sock != -1) {
+                    auto dataLeft = inPassthroughFrameLeft->getData();
+                    int hLeft = inPassthroughFrameLeft->getHeight();
+                    int wLeft = inPassthroughFrameLeft->getWidth();
+                    cv::Mat frameLeft(hLeft, wLeft, CV_8UC1, (void*)dataLeft.data());
+                    sendFramePacket(inet_sock, inet_addr_remote, frameLeft, FRAME_SIDE_LEFT);
+                }
+            }
+            continue;
+        } else if (q_name == "passthroughFrameRight") {
+            if(passthroughImageRightQueue) {
+                auto inPassthroughFrameRight = passthroughImageRightQueue->get<dai::ImgFrame>();
+                if(inet_enabled && inet_sock != -1) {
+                    auto dataRight = inPassthroughFrameRight->getData();
+                    int hRight = inPassthroughFrameRight->getHeight();
+                    int wRight = inPassthroughFrameRight->getWidth();
+                    cv::Mat frameRight(hRight, wRight, CV_8UC1, (void*)dataRight.data());
+                    sendFramePacket(inet_sock, inet_addr_remote, frameRight, FRAME_SIDE_RIGHT);
+                }
+            }
+            continue;
+        }
         if (q_name == "trackedFeaturesLeft") { // waits until specified queue gets a message
+            auto t0 = clock::now();
             auto data = outputFeaturesLeftQueue->get<dai::TrackedFeatures>();
             l_features = data->trackedFeatures;
             l_seq = data->getSequenceNum(); // retrieve sequence number
             features_tp = data->getTimestampDevice(); // timestamp from camera
             l_sum += std::chrono::duration<float, std::milli>(now_host - data->getTimestamp()).count();
             ++l_count;
+            t_tracked_left += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(clock::now() - t0);
+            ++cnt_tracked_left;
         } else if (q_name == "trackedFeaturesRight") {
+            auto t0 = clock::now();
             auto data = outputFeaturesRightQueue->get<dai::TrackedFeatures>();
             r_features = data->trackedFeatures;
             r_seq = data->getSequenceNum();
@@ -471,7 +570,10 @@ int main(int argc, char **argv) {
             for (const auto &feature : r_features) {
                 r_cur_features[feature.id] = feature.position; // map features to indexes
             }
+            t_tracked_right += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(clock::now() - t0);
+            ++cnt_tracked_right;
         } else if (q_name == "disparity") {
+            auto t0 = clock::now();
             auto disp_data = disp_queue->get<dai::ImgFrame>();
             disp_seq = disp_data->getSequenceNum();
             disp_frame = disp_data->getData(); // return only disparity data from frame
@@ -479,41 +581,41 @@ int main(int argc, char **argv) {
             pDisp_frame16 = reinterpret_cast<uint16_t*>(disp_frame.data());
             disp_sum += std::chrono::duration<float, std::milli>(now_host - disp_data->getTimestamp()).count();
             ++disp_count;
+            t_disp += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(clock::now() - t0);
+            ++cnt_disp;
         } else if (q_name == "imu") {
-            // IMU branch optimizations (safe, behavior-preserving):
-            // - use const refs to avoid accidental copies
-            // - reuse a single small buffer per IMU-event (stack-allocated once per q_name)
-            // - cache timestamp conversion into a local double to avoid repeated expression overhead
-            // - explicitly ignore sendto return value to avoid compiler warnings
+            auto t0 = clock::now();
             auto imuData = imuQueue->get<dai::IMUData>();
-            const auto &imuPackets = imuData->packets;
-
-            // Small stack buffer reused for every packet in this batch (keeps one allocation, tiny and fast)
-            double imu_buf[7];
-            for (const auto &imuPacket : imuPackets) {
-                const auto &acc = imuPacket.acceleroMeter;
-                const auto &gyro = imuPacket.gyroscope;
-
-                // compute timestamp once per packet
-                double ts = std::chrono::duration<double>(gyro.getTimestampDevice().time_since_epoch()).count();
-                imu_buf[0] = ts;
-
-                // translate to ROS frame (axis remap used elsewhere in project)
-                imu_buf[1] = -acc.z;
-                imu_buf[2] = -acc.y;
-                imu_buf[3] = -acc.x;
-                imu_buf[4] = -gyro.z;
-                imu_buf[5] = -gyro.y;
-                imu_buf[6] = -gyro.x;
-
-                // send immediately; ignore return value intentionally (non-blocking local socket typical)
-                (void)sendto(ipc_sock, imu_buf, sizeof(imu_buf), 0, (const struct sockaddr*)&imu_addr, sizeof(struct sockaddr_un));
-            }
-
-            if (!imu_ok) {
-                imu_ok = true;
-                std::cout << "imu ok\n";
-            }
+            const auto imuPackets = imuData->packets;
+                    for(const auto& imuPacket : imuPackets) {
+                        const auto& acc = imuPacket.acceleroMeter;
+                        const auto& gyro = imuPacket.gyroscope;
+                        // prepare local buffer for IMU message
+                        double imu_buf[7];
+                        imu_buf[0] = std::chrono::duration<double>(gyro.getTimestampDevice().time_since_epoch()).count();
+                        // translate to ros frame
+                        imu_buf[1] = -acc.z;
+                        imu_buf[2] = -acc.y;
+                        imu_buf[3] = -acc.x;
+                        imu_buf[4] = -gyro.z;
+                        imu_buf[5] = -gyro.y;
+                        imu_buf[6] = -gyro.x;
+                        // synchronous send and measure
+                        auto t1 = clock::now();
+                        ssize_t sent = sendto(ipc_sock, imu_buf, sizeof(imu_buf), 0, (struct sockaddr*)&imu_addr, sizeof(struct sockaddr_un));
+                        t_send += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(clock::now() - t1);
+                        ++cnt_send;
+                        // if (sent == -1) {
+                        //     perror("imu data send failed");
+                        //     camera_run = 0;
+                        // }
+                    }
+            t_imu += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(clock::now() - t0);
+            ++cnt_imu;
+             if (!imu_ok) {
+                 imu_ok = true;
+                 std::cout << "imu ok\n";
+             }
         }
 
         if (l_seq == r_seq && r_seq == disp_seq) { // executes if left, right and disparity frames align
@@ -523,10 +625,17 @@ int main(int argc, char **argv) {
             disp_seq = -3;
             std::unordered_map<int , dai::Point2f> features;
             int c = 0;
-            // prepare a local buffer: [count, timestamp, feature blocks...]
-            std::vector<double> features_msg(2 + NUMBEROF_DATA * MAXIMUM_FEATURES);
-            features_msg[1] = std::chrono::duration<double>(features_tp.time_since_epoch()).count(); // duration between epoch and timestamp of frame expressed in seconds
+            // Reuse preallocated features_msg to eliminate per-frame allocations.
+            // The buffer capacity is MAXIMUM_FEATURES; we'll only send the first
+            // (2 + NUMBEROF_DATA * c) entries when enqueuing the message.
+            features_msg[1] = std::chrono::duration<double>(features_tp.time_since_epoch()).count(); // frame timestamp (seconds)
             size_t buf_index = 2; // first two slots are occupied with timestamps
+            auto t_pair0 = clock::now();
+            // Debug: print counts of tracked features and disparity buffer size occasionally
+            if((num_frames % 10) == 0) {
+                size_t disp_len = disp_frame.empty() ? 0 : disp_frame.size() / sizeof(uint16_t);
+                std::cout << "DBG: l_features=" << l_features.size() << " r_features=" << r_features.size() << " disp_len=" << disp_len << "\n";
+            }
             for (const auto &l_feature : l_features) {
                 float x = l_feature.position.x;
                 float y = l_feature.position.y;
@@ -570,7 +679,7 @@ int main(int argc, char **argv) {
                         features_msg[buf_index + 11] = vx;
                         features_msg[buf_index + 12] = vy;
 
-                        if (c < MAXIMUM_FEATURES) { // maximum number of features
+                        if (c < max_features) { // maximum number of features
                             ++c;
                             buf_index += NUMBEROF_DATA; // move to next position in buffer accordingly
                         }
@@ -635,7 +744,7 @@ int main(int argc, char **argv) {
                             features_msg[buf_index + 11] = vx;
                             features_msg[buf_index + 12] = vy;
 
-                            if (c < MAXIMUM_FEATURES) {
+                            if (c < max_features) {
                                 ++c;
                                 buf_index += NUMBEROF_DATA;
                             }
@@ -645,6 +754,10 @@ int main(int argc, char **argv) {
                     }
                 }
             }
+            
+            // pairing duration
+            t_pairing += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(clock::now() - t_pair0);
+            ++cnt_pairing;
             // logging every 60 frames
             num_frames++;
             if (num_frames > 60) {
@@ -653,40 +766,80 @@ int main(int argc, char **argv) {
                 std::cout << "average latency LEFT: " << l_sum/l_count << " ms\n";
                 std::cout << "average latency RIGHT: " << r_sum/r_count << " ms\n";
                 std::cout << "average latency DISPARITY: " << disp_sum/disp_count << " ms\n";
+                // Print timing instrumentation averages (ms)
+                if (cnt_tracked_left) std::cout << "avg trackedLeft: " << (t_tracked_left.count() / static_cast<double>(cnt_tracked_left)) << " ms over " << cnt_tracked_left << " samples\n";
+                if (cnt_tracked_right) std::cout << "avg trackedRight: " << (t_tracked_right.count() / static_cast<double>(cnt_tracked_right)) << " ms over " << cnt_tracked_right << " samples\n";
+                if (cnt_disp) std::cout << "avg disparity: " << (t_disp.count() / static_cast<double>(cnt_disp)) << " ms over " << cnt_disp << " samples\n";
+                if (cnt_imu) std::cout << "avg imu: " << (t_imu.count() / static_cast<double>(cnt_imu)) << " ms over " << cnt_imu << " samples\n";
+                if (cnt_pairing) std::cout << "avg pairing: " << (t_pairing.count() / static_cast<double>(cnt_pairing)) << " ms over " << cnt_pairing << " samples\n";
+                if (cnt_prev_update) std::cout << "avg prev_update: " << (t_prev_update.count() / static_cast<double>(cnt_prev_update)) << " ms over " << cnt_prev_update << " samples\n";
+                if (cnt_send) std::cout << "avg send: " << (t_send.count() / static_cast<double>(cnt_send)) << " ms over " << cnt_send << " samples\n";
                 l_sum = 0.0;
                 r_sum = 0.0;
                 disp_sum = 0.0;
                 l_count = 0;
                 r_count = 0;
                 disp_count = 0;
+                // reset instrumentation counters and timers
+                t_tracked_left = decltype(t_tracked_left){0};
+                t_tracked_right = decltype(t_tracked_right){0};
+                t_disp = decltype(t_disp){0};
+                t_imu = decltype(t_imu){0};
+                t_pairing = decltype(t_pairing){0};
+                t_prev_update = decltype(t_prev_update){0};
+                t_send = decltype(t_send){0};
+                cnt_tracked_left = cnt_tracked_right = cnt_disp = cnt_imu = cnt_pairing = cnt_prev_update = cnt_send = 0;
             }
             if (c < MIN_FEATURES) std::cout << "WARNING: too few features: " << c << "\n";
+            size_t featurePayloadBytes = static_cast<size_t>(2 + NUMBEROF_DATA * c) * sizeof(double);
             // sending features
-            if (c > 0) {
                 if (c > 0 && imu_ok) {
                     features_msg[0] = static_cast<double>(c);
-                    ssize_t sent = sendto(ipc_sock, features_msg.data(), static_cast<size_t>(2 + NUMBEROF_DATA * c) * sizeof(double), 0, (struct sockaddr*)&features_addr, sizeof(struct sockaddr_un));
+                    // Send features message directly (synchronous) and measure send time
+                    auto t1 = clock::now();
+                    ssize_t sent = sendto(ipc_sock, features_msg.data(), featurePayloadBytes, 0, (struct sockaddr*)&features_addr, sizeof(struct sockaddr_un));
+                    t_send += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(clock::now() - t1);
+                    ++cnt_send;
                     // if (sent == -1) {
                     //     perror("features data send failed");
                     //     camera_run = 0;
                     // }
+            }
+            // Also optionally send features over INET (UDP). Socket is non-blocking; if send would block
+            // we drop the packet to avoid stalling the main loop.
+            if(inet_enabled && inet_sock != -1) {
+                features_msg[0] = static_cast<double>(c);
+                ssize_t sent2 = sendto(inet_sock, features_msg.data(), featurePayloadBytes, 0, (struct sockaddr*)&inet_addr_remote, sizeof(inet_addr_remote));
+                if (sent2 == -1) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        // socket busy, drop packet (non-fatal)
+                    } else {
+                        // log unexpected errors once
+                        perror("inet sendto failed");
+                    }
                 }
             }
 
             // current frame moved to previous to make place for new frame
-            l_prv_features = features;
-            prv_features_tp = features_tp;
-            r_prv_features.clear();
-            for (const auto &r_feature : r_features) {
-                r_prv_features[r_feature.id] = dai::Point2f(
-                    static_cast<float>(r_inv_k11 * r_feature.position.x + r_inv_k13),
-                    static_cast<float>(r_inv_k22 * r_feature.position.y + r_inv_k23)
-                );
+            {
+                auto t0 = clock::now();
+                l_prv_features = features;
+                prv_features_tp = features_tp;
+                r_prv_features.clear();
+                for (const auto &r_feature : r_features) {
+                    r_prv_features[r_feature.id] = dai::Point2f(
+                        static_cast<float>(r_inv_k11 * r_feature.position.x + r_inv_k13),
+                        static_cast<float>(r_inv_k22 * r_feature.position.y + r_inv_k23)
+                    );
+                }
+                t_prev_update += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(clock::now() - t0);
+                ++cnt_prev_update;
             }
         }
     }
 
     close(ipc_sock);
+    if(inet_sock != -1) close(inet_sock);
     std::cout << "bye\n";
 
     return 0;
