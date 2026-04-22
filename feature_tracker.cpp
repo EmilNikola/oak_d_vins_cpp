@@ -29,13 +29,18 @@ je pDisp_frame16 safe? k zamysleni
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <memory>
+#include <fstream>
 // threading / IPC helpers (removed - sender thread disabled)
 
 // Includes common necessary includes for development using depthai library
 #include "depthai/depthai.hpp"
 #include <unordered_map>
 
-#define PAIR_DIST_SQ 9 // threshold macro
+#include <atomic>
+
+// Pairing distance threshold (squared pixel distance). Default: 9 (3px radius).
+// Can be overridden at runtime via argv[25].
+static int pair_dist_sq = 9;
 #define MIN_FEATURES 10
 #define MAXIMUM_FEATURES 118
 #define NUMBEROF_DATA 13
@@ -149,9 +154,18 @@ int main(int argc, char **argv) {
     int motion_idx = -1; // 0 = Lucas-Kanade (default), 1 = HW motion estimation
     if(argc > 11) median_idx = static_cast<int>(strtol(argv[11], NULL, 10));
     if(argc > 12) ext_disp_idx = static_cast<int>(strtol(argv[12], NULL, 10));
-    if(argc > 13) subpixel_flag = static_cast<int>(strtol(argv[13], NULL, 10));
-    if(argc > 14) subpixel_frac = static_cast<int>(strtol(argv[14], NULL, 10));
+    if(argc > 13) subpixel_flag = static_cast<int>(strtol(argv[14], NULL, 10));
+    if(argc > 14) subpixel_frac = static_cast<int>(strtol(argv[13], NULL, 10));
     if(argc > 15) motion_idx = static_cast<int>(strtol(argv[15], NULL, 10));
+
+    // Optional pairing distance override: argv[25]
+    // argv[24] is used for features_log_filename; so use argv[25] for pair distance.
+    if(argc > 25) {
+        int tmp = static_cast<int>(strtol(argv[25], NULL, 10));
+        if(tmp > 0) {
+            pair_dist_sq = tmp;
+        }
+    }
 
     CAM_W = static_cast<int>(strtol(argv[18], NULL, 10));
     CAM_H = static_cast<int>(strtol(argv[19], NULL, 10));
@@ -364,6 +378,24 @@ int main(int argc, char **argv) {
         depth->setSubpixelFractionalBits(subpixel_frac);
     }
 
+    // Compute disparity divisor from fractional bits used by StereoDepth.
+    // Device encodes disparity as fixed-point: raw = disparity_pixels * (2^fractional_bits).
+    // Default historically used in this code was 3 fractional bits -> divisor = 8.
+    float disparity_divisor = 8.0f;
+    if(subpixel_flag <= 0) {
+        // Subpixel disabled -> integer disparities
+        disparity_divisor = 1.0f;
+    } else {
+        if(subpixel_frac >= 0) {
+            // Use explicit fractional bits provided by CLI
+            disparity_divisor = static_cast<float>(1u << subpixel_frac);
+        } else {
+            // Subpixel enabled but fractional bits not provided; keep historical default
+            disparity_divisor = 8.0f;
+        }
+    }
+    std::cout << "disparity_divisor=" << disparity_divisor << " (subpixel_flag=" << subpixel_flag << ", subpixel_frac=" << subpixel_frac << ")\n";
+
     depth->setDepthAlign(dai::RawStereoDepthConfig::AlgorithmControl::DepthAlign::RECTIFIED_LEFT); // not within preset
     depth->setAlphaScaling(0); // not within preset
     /*
@@ -468,6 +500,18 @@ int main(int argc, char **argv) {
     // Input queue to send runtime FeatureTracker config updates (optional)
     auto inputFeatureTrackerConfigQueue = device.getInputQueue("trackedFeaturesConfig");
 
+    // Optional tracked features logging to CSV. Provide filename via argv[24],
+    // otherwise defaults to "tracked_features.csv" in the current directory.
+    std::string features_log_filename = "tracked_features.csv";
+    if(argc > 24 && argv[24]) features_log_filename = std::string(argv[24]);
+    std::ofstream features_log(features_log_filename, std::ios::out | std::ios::trunc);
+    if(features_log.is_open()) {
+        features_log << "device_time,side,seq,id,age,x,y,harrisScore,trackingError\n";
+    } else {
+        std::cerr << "Warning: failed to open features log file: " << features_log_filename << "\n";
+    }
+    size_t features_log_counter = 0;
+
     // sequence numbers initialisation
     int l_seq = -1, r_seq = -2, disp_seq = -3;
 
@@ -557,6 +601,17 @@ int main(int argc, char **argv) {
             ++l_count;
             t_tracked_left += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(clock::now() - t0);
             ++cnt_tracked_left;
+
+            // Log left features to CSV if enabled
+            if (features_log.is_open()) {
+                double ts = std::chrono::duration<double>(features_tp.time_since_epoch()).count();
+                for (const auto &f : l_features) {
+                    features_log << ts << ",L," << l_seq << "," << f.id << "," << f.age << "," << f.position.x << "," << f.position.y << "," << f.harrisScore << "," << f.trackingError << "\n";
+                    ++features_log_counter;
+                }
+                // Flush occasionally to avoid large in-memory buffering
+                if ((features_log_counter & 0x3FF) == 0) features_log.flush();
+            }
         } else if (q_name == "trackedFeaturesRight") {
             auto t0 = clock::now();
             auto data = outputFeaturesRightQueue->get<dai::TrackedFeatures>();
@@ -569,6 +624,15 @@ int main(int argc, char **argv) {
             r_cur_features.reserve(r_features.size());
             for (const auto &feature : r_features) {
                 r_cur_features[feature.id] = feature.position; // map features to indexes
+            }
+            // Log right features to CSV if enabled
+            if (features_log.is_open()) {
+                double ts_r = std::chrono::duration<double>(data->getTimestampDevice().time_since_epoch()).count();
+                for (const auto &f : r_features) {
+                    features_log << ts_r << ",R," << r_seq << "," << f.id << "," << f.age << "," << f.position.x << "," << f.position.y << "," << f.harrisScore << "," << f.trackingError << "\n";
+                    ++features_log_counter;
+                }
+                if ((features_log_counter & 0x3FF) == 0) features_log.flush();
             }
             t_tracked_right += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(clock::now() - t0);
             ++cnt_tracked_right;
@@ -631,11 +695,6 @@ int main(int argc, char **argv) {
             features_msg[1] = std::chrono::duration<double>(features_tp.time_since_epoch()).count(); // frame timestamp (seconds)
             size_t buf_index = 2; // first two slots are occupied with timestamps
             auto t_pair0 = clock::now();
-            // Debug: print counts of tracked features and disparity buffer size occasionally
-            if((num_frames % 10) == 0) {
-                size_t disp_len = disp_frame.empty() ? 0 : disp_frame.size() / sizeof(uint16_t);
-                std::cout << "DBG: l_features=" << l_features.size() << " r_features=" << r_features.size() << " disp_len=" << disp_len << "\n";
-            }
             for (const auto &l_feature : l_features) {
                 float x = l_feature.position.x;
                 float y = l_feature.position.y;
@@ -702,12 +761,13 @@ int main(int argc, char **argv) {
                     // No valid disparity for this pixel -> skip
                     continue;
                 }
-                disp = static_cast<float>(pDisp_frame16[disp_idx]) / 8.0f; // disparity value at pixel position
+                // Convert raw fixed-point disparity to pixels using configured divisor.
+                disp = static_cast<float>(pDisp_frame16[disp_idx]) / disparity_divisor; // disparity value at pixel position
                 if (disp > 0) { // if there exists a disparity
                     for (const auto &r_feature : r_features) {
                         float dy = y - r_feature.position.y; // difference between l and accredited to noise
                         float dx = x - disp - r_feature.position.x; // difference = noise and also disparity (epipolar shift)
-                        if (dy * dy + dx * dx <= PAIR_DIST_SQ) { //pair found, aim for 95 percentile?
+                        if (dy * dy + dx * dx <= pair_dist_sq) { //pair found, aim for 95 percentile?
                             lr_id_mapping[l_feature.id] = r_feature.id; // persists over multiple frames if feature is repeatedly found
                             // same as left side
                             double dt = std::chrono::duration<double>(features_tp - prv_features_tp).count();
@@ -840,6 +900,11 @@ int main(int argc, char **argv) {
 
     close(ipc_sock);
     if(inet_sock != -1) close(inet_sock);
+    if(features_log.is_open()) {
+        features_log.flush();
+        features_log.close();
+        std::cout << "Wrote " << features_log_counter << " feature records to " << features_log_filename << "\n";
+    }
     std::cout << "bye\n";
 
     return 0;
