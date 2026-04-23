@@ -696,6 +696,7 @@ int main(int argc, char **argv) {
             size_t buf_index = 2; // first two slots are occupied with timestamps
             auto t_pair0 = clock::now();
             for (const auto &l_feature : l_features) {
+                if (c >= max_features) break;
                 float x = l_feature.position.x;
                 float y = l_feature.position.y;
                 double cur_un_x = l_inv_k11 * x + l_inv_k13; // normalised current x position
@@ -706,6 +707,7 @@ int main(int argc, char **argv) {
                     auto r_feature = r_cur_features.find(lr_id->second); // tries to find that feature in current right side
                     if (r_feature != r_cur_features.end()) { // checks if previous line found instance
                         double dt = std::chrono::duration<double>(features_tp - prv_features_tp).count(); // timestamp difference between current and latest dispartity frame
+                        if (dt <= 1e-9) dt = 1e-6; // guard against division by zero / tiny dt
                         double vx = 0, vy = 0;
                         auto prv_pos = l_prv_features.find(l_feature.id); // checks if previous left side feature is located in the new one
                         if (prv_pos != l_prv_features.end()) { // if its found, normalised speed is calculated
