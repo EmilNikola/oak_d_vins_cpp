@@ -131,22 +131,12 @@ int main(int argc, char **argv) {
     if(argc > 10) {
         allow = static_cast<int>(strtol(argv[10], NULL, 10));
     }
-    // depth preset selection via argv[4] (optional):
-    // 0 = FAST_ACCURACY
-    // 1 = FAST_DENSITY
-    // 2 = DEFAULT
-    // 3 = FACE
-    // 4 = HIGH_DETAIL
-    // 5 = ROBOTICS
+
     int depth_preset_idx = 0; // default
     if(argc > 4) {
         depth_preset_idx = static_cast<int>(strtol(argv[4], NULL, 10));
     }
-    // optional overrides (argv indices after existing args):
-    // argv[11] = median filter: 0=MEDIAN_OFF, 1=KERNEL_5x5, 2=KERNEL_7x7
-    // argv[12] = extended disparity: 0=false, 1=true
-    // argv[13] = subpixel enabled: 0=false, 1=true
-    // argv[14] = subpixel fractional bits (int)
+
     int median_idx = -1;
     int ext_disp_idx = -1;
     int subpixel_flag = -1;
@@ -154,8 +144,8 @@ int main(int argc, char **argv) {
     int motion_idx = -1; // 0 = Lucas-Kanade (default), 1 = HW motion estimation
     if(argc > 11) median_idx = static_cast<int>(strtol(argv[11], NULL, 10));
     if(argc > 12) ext_disp_idx = static_cast<int>(strtol(argv[12], NULL, 10));
-    if(argc > 13) subpixel_flag = static_cast<int>(strtol(argv[14], NULL, 10));
-    if(argc > 14) subpixel_frac = static_cast<int>(strtol(argv[13], NULL, 10));
+    if(argc > 13) subpixel_frac = static_cast<int>(strtol(argv[13], NULL, 10));
+    if(argc > 14) subpixel_flag = static_cast<int>(strtol(argv[14], NULL, 10));
     if(argc > 15) motion_idx = static_cast<int>(strtol(argv[15], NULL, 10));
 
     // Optional pairing distance override: argv[25]
@@ -328,9 +318,6 @@ int main(int argc, char **argv) {
     // default values (safe): 2 shaves, 2 slices
     int numShaves = 2;
     int numSlices = 2;
-    // Optional argv overrides:
-    // argv[16] = numShaves (int)
-    // argv[17] = numSlices (int)
     if(argc > 16) numShaves = static_cast<int>(strtol(argv[16], NULL, 10));
     if(argc > 17) numSlices = static_cast<int>(strtol(argv[17], NULL, 10));
     featureTrackerLeft->setHardwareResources(numShaves, numSlices);
@@ -358,13 +345,16 @@ int main(int argc, char **argv) {
                 depth->initialConfig.setMedianFilter(dai::MedianFilter::MEDIAN_OFF);
                 break;
             case 1:
-                depth->initialConfig.setMedianFilter(dai::MedianFilter::KERNEL_5x5);
+                depth->initialConfig.setMedianFilter(dai::MedianFilter::KERNEL_3x3);
                 break;
             case 2:
+                depth->initialConfig.setMedianFilter(dai::MedianFilter::KERNEL_5x5);
+                break;
+            case 3:
                 depth->initialConfig.setMedianFilter(dai::MedianFilter::KERNEL_7x7);
                 break;
             default:
-                depth->initialConfig.setMedianFilter(dai::MedianFilter::KERNEL_5x5);
+                depth->initialConfig.setMedianFilter(dai::MedianFilter::KERNEL_3x3);
                 break;
         }
     }
@@ -752,19 +742,26 @@ int main(int argc, char **argv) {
                 int col = roundf(x);
                 int row = roundf(y);
                 // setting bounds for possible values
+                if (col < 0) col = 0;
                 if (col > CAM_W - 1) col = CAM_W - 1;
+                if (row < 0) row = 0;
                 if (row > CAM_H - 1) row = CAM_H - 1;
                 // Defensive: ensure disparity buffer is valid before indexing
                 float disp = 0.0f;
                 size_t disp_idx = static_cast<size_t>(row) * CAM_W + static_cast<size_t>(col);
-                size_t disp_len = 0;
-                if (!disp_frame.empty()) disp_len = disp_frame.size() / sizeof(uint16_t);
-                if (pDisp_frame16 == nullptr || disp_idx >= disp_len) {
-                    // No valid disparity for this pixel -> skip
-                    continue;
+
+                if (subpixel_flag <= 0) {
+                    // 8-bit: one byte per pixel
+                    size_t disp_len = disp_frame.size();
+                    if (disp_idx >= disp_len) continue;
+                    disp = static_cast<float>(disp_frame[disp_idx]);
+                } else {
+                    // 16-bit subpixel: two bytes per pixel
+                    size_t disp_len = disp_frame.size() / sizeof(uint16_t);
+                    if (pDisp_frame16 == nullptr || disp_idx >= disp_len) continue;
+                    disp = static_cast<float>(pDisp_frame16[disp_idx]) / disparity_divisor;
                 }
-                // Convert raw fixed-point disparity to pixels using configured divisor.
-                disp = static_cast<float>(pDisp_frame16[disp_idx]) / disparity_divisor; // disparity value at pixel position
+
                 if (disp > 0) { // if there exists a disparity
                     for (const auto &r_feature : r_features) {
                         float dy = y - r_feature.position.y; // difference between l and accredited to noise
