@@ -607,17 +607,6 @@ int main(int argc, char **argv) {
             ++l_count;
             t_tracked_left += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(clock::now() - t0);
             ++cnt_tracked_left;
-
-            // Log left features to CSV if enabled
-            if (features_log.is_open()) {
-                double ts = std::chrono::duration<double>(features_tp.time_since_epoch()).count();
-                for (const auto &f : l_features) {
-                    features_log << ts << ",L," << l_seq << "," << f.id << "," << f.age << "," << f.position.x << "," << f.position.y << "," << f.harrisScore << "," << f.trackingError << "\n";
-                    ++features_log_counter;
-                }
-                // Flush occasionally to avoid large in-memory buffering
-                if ((features_log_counter & 0x3FF) == 0) features_log.flush();
-            }
         } else if (q_name == "trackedFeaturesRight") {
             auto t0 = clock::now();
             auto data = outputFeaturesRightQueue->get<dai::TrackedFeatures>();
@@ -630,15 +619,6 @@ int main(int argc, char **argv) {
             r_cur_features.reserve(r_features.size());
             for (const auto &feature : r_features) {
                 r_cur_features[feature.id] = feature.position; // map features to indexes
-            }
-            // Log right features to CSV if enabled
-            if (features_log.is_open()) {
-                double ts_r = std::chrono::duration<double>(data->getTimestampDevice().time_since_epoch()).count();
-                for (const auto &f : r_features) {
-                    features_log << ts_r << ",R," << r_seq << "," << f.id << "," << f.age << "," << f.position.x << "," << f.position.y << "," << f.harrisScore << "," << f.trackingError << "\n";
-                    ++features_log_counter;
-                }
-                if ((features_log_counter & 0x3FF) == 0) features_log.flush();
             }
             t_tracked_right += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(clock::now() - t0);
             ++cnt_tracked_right;
@@ -748,6 +728,12 @@ int main(int argc, char **argv) {
 
                         if (c < max_features) { // maximum number of features
                             ++c;
+                            // Log paired features to CSV if enabled
+                            if (features_log.is_open()) {
+                                double ts = std::chrono::duration<double>(features_tp.time_since_epoch()).count();
+                                features_log << ts << ",L," << l_seq << "," << l_feature.id << "," << l_feature.age << "," << l_feature.position.x << "," << l_feature.position.y << "," << l_feature.harrisScore << "," << l_feature.trackingError << "\n";
+                                ++features_log_counter;
+                            }
                             buf_index += NUMBEROF_DATA; // move to next position in buffer accordingly
                         }
 
@@ -821,6 +807,12 @@ int main(int argc, char **argv) {
 
                             if (c < max_features) {
                                 ++c;
+                                // Log paired features to CSV if enabled
+                                if (features_log.is_open()) {
+                                    double ts = std::chrono::duration<double>(features_tp.time_since_epoch()).count();
+                                    features_log << ts << ",L," << l_seq << "," << l_feature.id << "," << l_feature.age << "," << l_feature.position.x << "," << l_feature.position.y << "," << l_feature.harrisScore << "," << l_feature.trackingError << "\n";
+                                    ++features_log_counter;
+                                }
                                 buf_index += NUMBEROF_DATA;
                             }
 
