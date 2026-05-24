@@ -157,6 +157,22 @@ int main(int argc, char **argv) {
         }
     }
 
+    // Feature tracker thresholds: argv[26] = tracking error, argv[27] = Harris score
+    int tracking_error_threshold = 50000; // default
+    int harris_score_threshold = 200000; // default
+    if(argc > 26) {
+        int tmp = static_cast<int>(strtol(argv[26], NULL, 10));
+        if(tmp > 0) {
+            tracking_error_threshold = tmp;
+        }
+    }
+    if(argc > 27) {
+        int tmp = static_cast<int>(strtol(argv[27], NULL, 10));
+        if(tmp > 0) {
+            harris_score_threshold = tmp;
+        }
+    }
+
     CAM_W = static_cast<int>(strtol(argv[18], NULL, 10));
     CAM_H = static_cast<int>(strtol(argv[19], NULL, 10));
 
@@ -303,10 +319,10 @@ int main(int argc, char **argv) {
         featureTrackerConfig.motionEstimator.opticalFlow.epsilon = std::stof(argv[8], NULL);
         featureTrackerConfig.motionEstimator.opticalFlow.maxIterations = strtol(argv[9],NULL,10);
     }
-    //featureMaintainer likely to remain unchanged
-    //featureTrackerConfig.FeatureMaintainer.minimumDistanceBetweenFeatures = 50;
-    //featureTrackerConfig.FeatureMaintainer.lostFeatureErrorThreshold = 50000;
-    //featureTrackerConfig.FeatureMaintainer.trackedFeatureThreshold = 200000;
+    //featureMaintainer now configurable via command line arguments
+    featureTrackerConfig.featureMaintainer.minimumDistanceBetweenFeatures = 50;
+    featureTrackerConfig.featureMaintainer.lostFeatureErrorThreshold = tracking_error_threshold;
+    featureTrackerConfig.featureMaintainer.trackedFeatureThreshold = harris_score_threshold;
     
 
     featureTrackerLeft->initialConfig.set(featureTrackerConfig);
