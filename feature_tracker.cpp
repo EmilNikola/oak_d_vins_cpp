@@ -173,6 +173,15 @@ int main(int argc, char **argv) {
         }
     }
 
+    // StereoDepth confidence threshold: argv[28] (range 0-255, default 200)
+    int depth_confidence_threshold = 200; // default
+    if(argc > 28) {
+        int tmp = static_cast<int>(strtol(argv[28], NULL, 10));
+        if(tmp >= 0 && tmp <= 255) {
+            depth_confidence_threshold = tmp;
+        }
+    }
+
     CAM_W = static_cast<int>(strtol(argv[18], NULL, 10));
     CAM_H = static_cast<int>(strtol(argv[19], NULL, 10));
 
@@ -383,6 +392,9 @@ int main(int argc, char **argv) {
     if(subpixel_frac >= 0) {
         depth->setSubpixelFractionalBits(subpixel_frac);
     }
+
+    // Set confidence threshold for depth computation (0-255)
+    depth->initialConfig.setConfidenceThreshold(depth_confidence_threshold);
 
     // Compute disparity divisor from fractional bits used by StereoDepth.
     // Device encodes disparity as fixed-point: raw = disparity_pixels * (2^fractional_bits).
