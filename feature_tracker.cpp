@@ -124,6 +124,40 @@ void printConfig(const char *time, dai::RawFeatureTrackerConfig cfg) {
     std::cout << "maintainTresholdsTrackedFeature " << cfg.featureMaintainer.trackedFeatureThreshold << "\n";
 }
 
+// Helper function to calculate mean and standard deviation
+struct Statistics {
+    float mean;
+    float stddev;
+    float min_val;
+    float max_val;
+    size_t count;
+};
+
+Statistics calculateStats(const std::vector<float>& data) {
+    Statistics stats = {0.0f, 0.0f, 0.0f, 0.0f, data.size()};
+    if (data.empty()) return stats;
+    
+    // Calculate mean
+    float sum = 0.0f;
+    stats.min_val = data[0];
+    stats.max_val = data[0];
+    for (float val : data) {
+        sum += val;
+        stats.min_val = std::min(stats.min_val, val);
+        stats.max_val = std::max(stats.max_val, val);
+    }
+    stats.mean = sum / data.size();
+    
+    // Calculate standard deviation
+    float var_sum = 0.0f;
+    for (float val : data) {
+        var_sum += (val - stats.mean) * (val - stats.mean);
+    }
+    stats.stddev = std::sqrt(var_sum / data.size());
+    
+    return stats;
+}
+
 int main(int argc, char **argv) {
     bool imu_ok = false;
     int num_frames=0; // number of frames
@@ -561,6 +595,16 @@ int main(int argc, char **argv) {
 
     // (spatial grid removed) pairing currently uses direct scan; keep simple for now
 
+    // Statistics tracking for parameter optimization
+    std::vector<float> stat_pair_distances;      // actual pairing distances (sqrt of pair_dist_sq)
+    std::vector<float> stat_tracking_errors;     // actual tracking errors
+    std::vector<float> stat_harris_scores;       // actual harris scores
+    std::vector<float> stat_disparities;         // actual disparities for confidence analysis
+    stat_pair_distances.reserve(10000);
+    stat_tracking_errors.reserve(10000);
+    stat_harris_scores.reserve(10000);
+    stat_disparities.reserve(10000);
+
     // Clear queue events
     //jakaskerl suggest remove this line
     //https://discuss.luxonis.com/d/3484-getqueueevent-takes-much-additional-time/7
@@ -695,6 +739,10 @@ int main(int argc, char **argv) {
             auto t_pair0 = clock::now();
             for (const auto &l_feature : l_features) {
                 if (c >= max_features) break;
+                // Collect statistics
+                stat_harris_scores.push_back(static_cast<float>(l_feature.harrisScore));
+                stat_tracking_errors.push_back(static_cast<float>(l_feature.trackingError));
+                
                 float x = l_feature.position.x;
                 float y = l_feature.position.y;
                 double cur_un_x = l_inv_k11 * x + l_inv_k13; // normalised current x position
@@ -780,7 +828,12 @@ int main(int argc, char **argv) {
                     for (const auto &r_feature : r_features) {
                         float dy = y - r_feature.position.y; // difference between l and accredited to noise
                         float dx = x - disp - r_feature.position.x; // difference = noise and also disparity (epipolar shift)
-                        if (dy * dy + dx * dx <= pair_dist_sq) { //pair found, aim for 95 percentile?
+                        float pair_dist = dy * dy + dx * dx;
+                        if (pair_dist <= pair_dist_sq) { //pair found, aim for 95 percentile?
+                            // Collect statistics for this pair
+                            stat_pair_distances.push_back(std::sqrt(pair_dist));
+                            stat_disparities.push_back(disp);
+                            
                             lr_id_mapping[l_feature.id] = r_feature.id; // persists over multiple frames if feature is repeatedly found
                             // same as left side
                             double dt = std::chrono::duration<double>(features_tp - prv_features_tp).count();
@@ -924,6 +977,50 @@ int main(int argc, char **argv) {
         features_log.close();
         std::cout << "Wrote " << features_log_counter << " feature records to " << features_log_filename << "\n";
     }
+    
+    // Print parameter statistics for optimization
+    std::cout << "\n=== PARAMETER OPTIMIZATION STATISTICS ===\n";
+    std::cout << "Use these values with ±1σ to tune your parameters\n\n";
+    
+    auto pair_dist_stats = calculateStats(stat_pair_distances);
+    std::cout << "argv[25] - Pair Distance (pixels):\n";
+    std::cout << "  Mean: " << pair_dist_stats.mean << " σ=" << pair_dist_stats.stddev << "\n";
+    std::cout << "  Range: [" << pair_dist_stats.min_val << ", " << pair_dist_stats.max_val << "]\n";
+    std::cout << "  Suggested: " << static_cast<int>(pair_dist_stats.mean) 
+              << " (mean), " << static_cast<int>(pair_dist_stats.mean + pair_dist_stats.stddev) 
+              << " (mean+σ), " << static_cast<int>(pair_dist_stats.mean + 2*pair_dist_stats.stddev) << " (mean+2σ)\n";
+    std::cout << "  Currently set to (squared): " << pair_dist_sq << " (= " 
+              << std::sqrt(pair_dist_sq) << " pixels)\n\n";
+    
+    auto tracking_error_stats = calculateStats(stat_tracking_errors);
+    std::cout << "argv[26] - Tracking Error Threshold:\n";
+    std::cout << "  Mean: " << tracking_error_stats.mean << " σ=" << tracking_error_stats.stddev << "\n";
+    std::cout << "  Range: [" << tracking_error_stats.min_val << ", " << tracking_error_stats.max_val << "]\n";
+    std::cout << "  Suggested: " << static_cast<int>(tracking_error_stats.mean) 
+              << " (mean), " << static_cast<int>(tracking_error_stats.mean + tracking_error_stats.stddev) 
+              << " (mean+σ), " << static_cast<int>(tracking_error_stats.mean + 2*tracking_error_stats.stddev) << " (mean+2σ)\n";
+    std::cout << "  Currently set to: " << tracking_error_threshold << "\n\n";
+    
+    auto harris_score_stats = calculateStats(stat_harris_scores);
+    std::cout << "argv[27] - Harris Score Threshold:\n";
+    std::cout << "  Mean: " << harris_score_stats.mean << " σ=" << harris_score_stats.stddev << "\n";
+    std::cout << "  Range: [" << harris_score_stats.min_val << ", " << harris_score_stats.max_val << "]\n";
+    std::cout << "  Suggested: " << static_cast<int>(harris_score_stats.mean) 
+              << " (mean), " << static_cast<int>(harris_score_stats.mean + harris_score_stats.stddev) 
+              << " (mean+σ), " << static_cast<int>(harris_score_stats.mean + 2*harris_score_stats.stddev) << " (mean+2σ)\n";
+    std::cout << "  Currently set to: " << harris_score_threshold << "\n\n";
+    
+    auto disparity_stats = calculateStats(stat_disparities);
+    std::cout << "argv[28] - Disparity Quality (for confidence threshold):\n";
+    std::cout << "  Mean disparity: " << disparity_stats.mean << " σ=" << disparity_stats.stddev << "\n";
+    std::cout << "  Range: [" << disparity_stats.min_val << ", " << disparity_stats.max_val << "]\n";
+    std::cout << "  Note: Higher confidence threshold (closer to 255) filters noisy disparities\n";
+    std::cout << "  Currently set to: " << depth_confidence_threshold << "\n";
+    std::cout << "  Suggestion: Try values from 150-250 based on depth quality needs\n\n";
+    
+    std::cout << "Total paired features analyzed: " << pair_dist_stats.count << "\n";
+    std::cout << "================================\n";
+    
     std::cout << "bye\n";
 
     return 0;
