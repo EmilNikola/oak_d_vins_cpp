@@ -30,7 +30,6 @@ je pDisp_frame16 safe? k zamysleni
 #include <opencv2/imgcodecs.hpp>
 #include <memory>
 #include <fstream>
-// threading / IPC helpers (removed - sender thread disabled)
 
 // Includes common necessary includes for development using depthai library
 #include "depthai/depthai.hpp"
@@ -105,9 +104,7 @@ void calc_rect_cam_intri_extri(dai::CalibrationHandler calibData, double* f, dou
     std::cout << "stereo extrinsics\n" << r << "\n" << t << "\n"; // additional temporary(?) printout
     
     cv::Mat r1, r2, p1, p2, q;
-    cv::stereoRectify(intri_l, dist_l, intri_r, dist_r, cv::Size(CAM_W, CAM_H), r, t, r1, r2, p1, p2, q, cv::CALIB_ZERO_DISPARITY, 0); // rectification transforms for stereo images alignment
-    // p1 and p2 are projection matrices in rectified coordinate system for cameras
-    // https://docs.opencv.org/3.4/d9/d0c/group__calib3d.html#ga617b1685d4059c6040827800e72ad2b6
+    cv::stereoRectify(intri_l, dist_l, intri_r, dist_r, cv::Size(CAM_W, CAM_H), r, t, r1, r2, p1, p2, q, cv::CALIB_ZERO_DISPARITY, 0); // stereo rectification
     std::cout << "P1\n" << p1 << "\nP2\n" << p2 << "\n";
     *f = p1.at<double>(0, 0);
     *cx = p1.at<double>(0, 2);
@@ -182,8 +179,7 @@ int main(int argc, char **argv) {
     if(argc > 14) subpixel_flag = static_cast<int>(strtol(argv[14], NULL, 10));
     if(argc > 15) motion_idx = static_cast<int>(strtol(argv[15], NULL, 10));
 
-    // Optional pairing distance override: argv[25]
-    // argv[24] is used for features_log_filename; so use argv[25] for pair distance.
+    // argv[25] for pair distance.
     if(argc > 25) {
         int tmp = static_cast<int>(strtol(argv[25], NULL, 10));
         if(tmp > 0) {
@@ -191,7 +187,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    // Feature tracker thresholds: argv[26] = tracking error, argv[27] = Harris score
+    // argv[26] = tracking error, argv[27] = Harris score
     int tracking_error_threshold = 50000; // default
     int harris_score_threshold = 200000; // default
     if(argc > 26) {
@@ -207,7 +203,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    // StereoDepth confidence threshold: argv[28] (range 0-255, default 200)
+    // rgv[28] (range 0-255, default 200)
     int depth_confidence_threshold = 200; // default
     if(argc > 28) {
         int tmp = static_cast<int>(strtol(argv[28], NULL, 10));
@@ -222,7 +218,7 @@ int main(int argc, char **argv) {
     // terminate process by calling SIGINT(Ctrl-C)
     struct sigaction act;
     memset(&act, 0, sizeof(act));
-    act.sa_handler = sig_func; // pointer to function
+    act.sa_handler = sig_func; // signal handler func
     sigaction(SIGINT, &act, NULL);
 
     // creating unix socket ,ipc_local_addr to send and receive points features_addr, imu_addr
@@ -241,7 +237,6 @@ int main(int argc, char **argv) {
         exit(EXIT_FAILURE);
     }
 
-    // NOTE: sender thread removed — sending will use direct sendto() again.
     memset(&imu_addr, 0, sizeof(struct sockaddr_un));
     imu_addr.sun_family = AF_UNIX;
     strcpy(imu_addr.sun_path, "/tmp/chobits_imu");
@@ -254,7 +249,6 @@ int main(int argc, char **argv) {
     bool inet_enabled = false;
     int inet_sock = -1;
     struct sockaddr_in inet_addr_remote;
-    // parse inet_enable flag if provided
     int inet_flag = 0;
     if(argc > 21) {
         inet_flag = static_cast<int>(strtol(argv[21], NULL, 10));
@@ -356,7 +350,7 @@ int main(int argc, char **argv) {
         featureTrackerConfig.motionEstimator.type = dai::FeatureTrackerConfig::MotionEstimator::Type::HW_MOTION_ESTIMATION;
     } else {
         featureTrackerConfig.motionEstimator.type = dai::FeatureTrackerConfig::MotionEstimator::Type::LUCAS_KANADE_OPTICAL_FLOW;
-        // Lukas-Kanade empirical config (only relevant for Lucas-Kanade)
+        // Lucas-Kanade params
         featureTrackerConfig.motionEstimator.opticalFlow.searchWindowWidth = strtol(argv[7],NULL,10);
         featureTrackerConfig.motionEstimator.opticalFlow.searchWindowHeight = strtol(argv[7],NULL,10);
         featureTrackerConfig.motionEstimator.opticalFlow.epsilon = std::stof(argv[8], NULL);
@@ -618,15 +612,10 @@ int main(int argc, char **argv) {
     uint64_t cnt_tracked_left = 0, cnt_tracked_right = 0, cnt_disp = 0, cnt_imu = 0, cnt_pairing = 0, cnt_send = 0, cnt_prev_update = 0;
 
     while(camera_run) {
-        // Micro-optimizations (kept behavior the same):
-        // 1) Cache a single host timestamp per loop to avoid calling steady_clock::now() multiple times.
-        // 2) Reserve the right-features map before inserting to avoid rehashing.
-        // 3) Use reinterpret_cast for the disparity pointer to make intent explicit.
-        // Note: tracked-features remain copied from the packet to preserve original semantics.
         auto q_name = device.getQueueEvent();
         auto now_host = std::chrono::steady_clock::now();
         
-        // Handle passthrough frames (optional). If passthrough is enabled and we receive
+        // Handle passthrough frames (optional). If passthrough is enabled and received
         // a passthroughFrame event, forward the JPEG over the INET socket if configured.
         if (q_name == "passthroughFrameLeft") {
             if(passthroughImageLeftQueue) {
@@ -670,7 +659,7 @@ int main(int argc, char **argv) {
             r_seq = data->getSequenceNum();
             r_sum += std::chrono::duration<float, std::milli>(now_host - data->getTimestamp()).count();
             ++r_count;
-            // Reserve capacity to avoid repeated rehashing when filling the map.
+            // Reserve capacity
             r_cur_features.clear();
             r_cur_features.reserve(r_features.size());
             for (const auto &feature : r_features) {
@@ -683,7 +672,7 @@ int main(int argc, char **argv) {
             auto disp_data = disp_queue->get<dai::ImgFrame>();
             disp_seq = disp_data->getSequenceNum();
             disp_frame = disp_data->getData(); // return only disparity data from frame
-            // Use reinterpret_cast to express that we're reinterpreting raw bytes as uint16_t samples.
+            // Use reinterpret_cast to reinterpret raw bytes as uint16_t samples.
             pDisp_frame16 = reinterpret_cast<uint16_t*>(disp_frame.data());
             disp_sum += std::chrono::duration<float, std::milli>(now_host - disp_data->getTimestamp()).count();
             ++disp_count;
